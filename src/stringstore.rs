@@ -8,7 +8,7 @@ use std::{
     cmp::Ordering,
     collections::HashMap,
     fmt::{self, Debug, Display, Formatter},
-    hash::BuildHasher,
+    hash::{BuildHasher, Hash, Hasher},
     ops::Deref,
 };
 
@@ -157,6 +157,12 @@ impl PartialOrd for StoredStr<'_> {
 impl Ord for StoredStr<'_> {
     fn cmp(&self, other: &Self) -> Ordering {
         self.0.cmp(&other.0)
+    }
+}
+
+impl Hash for StoredStr<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.hash(state)
     }
 }
 
