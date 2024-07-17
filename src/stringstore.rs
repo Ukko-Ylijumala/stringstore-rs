@@ -3,13 +3,15 @@
 #![allow(dead_code)]
 
 use crate::hashing::{hash_bytes, CustomXxh3Hasher};
-use size_of::SizeOf;
+use parking_lot::RwLock;
+use size_of::{Context, SizeOf};
 use std::{
     cmp::Ordering,
     collections::HashMap,
     fmt::{self, Debug, Display, Formatter},
     hash::{BuildHasher, Hash, Hasher},
     ops::Deref,
+    sync::Arc,
 };
 
 /**
@@ -28,10 +30,9 @@ in scenarios where many duplicate strings are used.
 ## Design Considerations
 - Uses a [Vec<Box<str>>] for string storage, which should ensure good cache
   locality and efficient random access.
-- Uses a [HashMap] with `*const str` keys for fast lookups.
+- Uses a [HashMap] with `u64` Xxh3 string hashes as keys for fast lookups.
 - Custom [xxhash_rust] hasher ([CustomXxh3Hasher]) for potentially faster hashing.
-- No removal operations to guarantee index stability.
-- Not thread-safe.
+- Thread-safe due to wrapping storage/index fields with [RwLock]s.
 
 ## Performance Characteristics
 - Insertion: O(1) average
@@ -45,74 +46,86 @@ duplicate strings and require fast lookups by both content and stable indices.
 
 ## Safety
 While most operations are safe, the `get_unchecked` method provides an unsafe,
-non-bounds-checking lookup (meant mostly for internal use with known indexes).
+non-bounds-checking lookup (meant mostly for internal use with known indices).
 
 ## Limitations
 - Does not support string removal to maintain index stability.
-- Not thread-safe.
+- Does not support string modification after insertion.
+- No partial deduplication of strings (e.g. substrings).
+- The maximum number of unique strings is limited by the [u32] index.
+- Methods which return a [StoredStr] reference can only be used if the
+  [UniqueStrStore] is wrapped in an [Arc] (as it must point back to the store).
 
 ## Example
 ```
 use statter::stringstore::UniqueStrStore;
 
 let hello: &'static str = "Hello, world!";
-let mut store = UniqueStrStore::new();
+let store = UniqueStrStore::new();
 
-let stored = store.insert(hello);
+store.insert(hello);
 assert_eq!(store.len(), 1);
 assert!(store.contains(hello));
 
-let again = store.insert(hello);
-let foo = store.insert("foo");
+store.insert(hello);
+store.insert("foo");
 assert_eq!(store.len(), 2);
-
-assert_eq!(stored.idx(), 0);
-assert_eq!(again.idx(), 0);
-assert_eq!(foo.idx(), 1);
-
-assert_eq!(stored.as_ref(), hello);
-assert_eq!(stored, again);
 assert_eq!(store.get(0).unwrap(), hello);
 assert_eq!(store.get_unchecked(1), "foo");
 */
-#[derive(Default, Debug, SizeOf)]
+#[derive(Default, Debug)]
 pub struct UniqueStrStore {
-    store: Vec<Box<str>>,
-    index: HashMap<u64, u32, CustomXxh3Hasher>,
+    store: RwLock<Vec<Box<str>>>,
+    index: RwLock<HashMap<u64, u32, CustomXxh3Hasher>>,
 }
 
 impl UniqueStrStore {
     pub fn new() -> Self {
-        let capacity: usize = 64 * 1024; // 65536 entries to start with
+        Self::new_with_capacity(128)
+    }
+
+    pub fn new_with_capacity(capacity: usize) -> Self {
         UniqueStrStore {
-            store: Vec::with_capacity(capacity),
+            store: Vec::with_capacity(capacity).into(),
             index: HashMap::with_capacity_and_hasher(
                 capacity,
                 CustomXxh3Hasher::default().build_hasher(),
-            ),
+            )
+            .into(),
         }
     }
 
-    /// Put this [UniqueStrStore] into a [Box].
-    pub fn boxed(self) -> Box<Self> {
-        Box::new(self)
+    /// Put this [UniqueStrStore] into an [Arc].
+    pub fn shared(self) -> Arc<Self> {
+        self.into()
     }
 
     /// The number of unique string slices stored.
     #[inline]
     pub fn len(&self) -> usize {
-        self.store.len()
+        self.store.read().len()
     }
 
     /// Whether we already have this string slice stored.
     #[inline]
     pub fn contains(&self, s: &str) -> bool {
-        self.index.contains_key(&hash_bytes(s.as_bytes()))
+        self.index.read().contains_key(&hash_bytes(s.as_bytes()))
+    }
+
+    /// Get the index of a stored string slice by its content, if it exists.
+    pub fn idx(&self, s: &str) -> Option<u32> {
+        self.index.read().get(&hash_bytes(s.as_bytes())).copied()
     }
 
     /// Get a reference to a stored string slice by its index, if it exists.
     pub fn get<'a>(&'a self, idx: u32) -> Option<&'a str> {
-        self.store.get(idx as usize).map(|s: &Box<str>| s.as_ref())
+        let store = self.store.read();
+        if idx as usize >= store.len() {
+            None
+        } else {
+            drop(store); // must release the lock to avoid a deadlock
+            Some(self.get_unchecked(idx))
+        }
     }
 
     /**
@@ -122,53 +135,126 @@ impl UniqueStrStore {
     ### Safety
     Calling this method with an out-of-bounds index is undefined behavior
     even if the resulting reference is not used.
+
+    Since we're going through a [RwLock], we need to do some extra pointer
+    magic, as returning a [Box::as_ref()] directly would make the borrow
+    checker complain about "cannot return value referencing local variable".
+
+    This should work too, but is more complicated:
+    ```ignore
+    let ptr: *const u8 = b.as_ptr();
+    let len: usize = b.len();
+    let bytes: &[u8] = core::slice::from_raw_parts(ptr, len);
+    std::str::from_utf8_unchecked(bytes)
     */
     #[inline]
     pub fn get_unchecked<'a>(&'a self, idx: u32) -> &'a str {
-        unsafe { self.store.get_unchecked(idx as usize).as_ref() }
+        let store = self.store.read();
+        unsafe {
+            let b: &Box<str> = store.get_unchecked(idx as usize);
+            let ptr = b.as_ref() as *const str;
+            &*ptr
+        }
     }
 
-    #[inline]
-    fn as_ptr(&self) -> *const UniqueStrStore {
-        self as *const UniqueStrStore
+    /**
+    Insert a new string foregoing the first index check before write locking.
+
+    We still must check again after acquiring the write locks, as another
+    thread might have gone behind our back in the meantime.
+    */
+    fn insert_unchecked(&self, s: String) -> u32 {
+        let mut store = self.store.write();
+        let mut index = self.index.write();
+        let key: u64 = hash_bytes(s.as_bytes());
+
+        // Check again to be safe.
+        if index.contains_key(&key) {
+            return index.get(&key).copied().unwrap();
+        }
+
+        let idx: u32 = store.len() as u32;
+        index.insert(key, idx);
+        store.push(s.into());
+        idx
     }
+
+    /// Insert a new string (slice), if it doesn't already exist.
+    /// Returns the index in either case.
+    pub fn insert<T>(&self, s: T) -> u32
+    where
+        T: Into<String>,
+    {
+        let s: String = s.into();
+        if let Some(idx) = self.idx(&s) {
+            idx
+        } else {
+            self.insert_unchecked(s)
+        }
+    }
+}
+
+/**
+This trait allows locking certain methods behind a shared reference.
+
+For now, this concerns methods which return a [StoredStr] reference, as that
+struct needs a stable pointer to the [UniqueStrStore] to function properly.
+*/
+pub trait SharedStrStore {
+    type Inner: Deref<Target = UniqueStrStore>;
+
+    fn get_ref(&self, s: &str) -> Option<StoredStr>;
+    fn insert_or_get<T>(&self, s: T) -> StoredStr
+    where
+        T: Into<String>;
+}
+
+impl SharedStrStore for Arc<UniqueStrStore> {
+    type Inner = Self;
 
     /// The reference of a stored string slice, if it exists.
     #[inline]
-    pub fn get_ref(&self, s: &str) -> Option<StoredStr> {
+    fn get_ref(&self, s: &str) -> Option<StoredStr> {
         self.index
+            .read()
             .get(&hash_bytes(s.as_bytes()))
             .copied()
-            .map(|idx: u32| StoredStr(idx, self.as_ptr()))
+            .map(|idx: u32| StoredStr(idx, self.clone()))
     }
 
     /// Insert a new string (slice) and return its [StoredStr] reference.
     ///
     /// If the string (slice) already exists, return its reference instead.
-    pub fn insert<T>(&mut self, s: T) -> StoredStr
+    fn insert_or_get<T>(&self, s: T) -> StoredStr
     where
         T: Into<String>,
     {
         let s: String = s.into();
-        if self.contains(&s) {
-            self.get_ref(&s).unwrap()
-        } else {
-            let idx: u32 = self.len() as u32;
-            self.index.insert(hash_bytes(s.as_bytes()), idx);
-            self.store.push(s.into());
-            StoredStr(idx, self.as_ptr())
+        if !self.contains(&s) {
+            self.insert_unchecked(s.clone());
         }
+        self.get_ref(&s).unwrap()
     }
 }
 
+// We have to implement our own since `size_of::SizeOf` does not support `RwLock`.
+impl SizeOf for UniqueStrStore {
+    fn size_of_children(&self, context: &mut Context) {
+        self.store.read().size_of_children(context);
+        self.index.read().size_of_children(context);
+    }
+}
+
+/* ######################################################################### */
+
 /// A reference (index) to a stored string slice in a [UniqueStrStore].
 #[derive(Clone)]
-pub struct StoredStr(u32, *const UniqueStrStore);
+pub struct StoredStr(u32, Arc<UniqueStrStore>);
 
 impl StoredStr {
     #[inline]
     fn reference(&self) -> &str {
-        unsafe { (*self.1).get_unchecked(self.0) }
+        (*self.1).get_unchecked(self.0)
     }
 
     /// Get the index of the stored string slice.
@@ -179,7 +265,7 @@ impl StoredStr {
 
     /// Get the reference to the [UniqueStrStore] that contains this string.
     pub fn store(&self) -> &UniqueStrStore {
-        unsafe { &*self.1 }
+        &*self.1
     }
 
     pub fn cloned(&self) -> String {
@@ -209,25 +295,25 @@ impl Eq for StoredStr {}
 
 impl PartialEq for StoredStr {
     fn eq(&self, other: &Self) -> bool {
-        self.0 == other.0
+        self.reference() == other.reference()
     }
 }
 
 impl PartialOrd for StoredStr {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        self.0.partial_cmp(&other.0)
+        self.reference().partial_cmp(&other.reference())
     }
 }
 
 impl Ord for StoredStr {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.0.cmp(&other.0)
+        self.reference().cmp(&other.reference())
     }
 }
 
 impl Hash for StoredStr {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.0.hash(state)
+        self.reference().hash(state)
     }
 }
 
@@ -247,6 +333,20 @@ impl Display for StoredStr {
 
 /* --------------------------------- */
 
+impl PartialEq<StoredStr> for &str {
+    fn eq(&self, other: &StoredStr) -> bool {
+        *self == other.reference()
+    }
+}
+
+impl PartialEq<&str> for StoredStr {
+    fn eq(&self, other: &&str) -> bool {
+        self.reference() == *other
+    }
+}
+
+/* --------------------------------- */
+
 // Implement `From` for converting `StoredStr` into `u32`.
 impl<'a> From<StoredStr> for u32 {
     fn from(v: StoredStr) -> u32 {
@@ -256,7 +356,8 @@ impl<'a> From<StoredStr> for u32 {
 
 impl<'a> From<StoredStr> for &'a str {
     fn from(v: StoredStr) -> &'a str {
-        unsafe { (*v.1).get_unchecked(v.0) }
+        let ptr = (*v.1).get_unchecked(v.0) as *const str;
+        unsafe { &*ptr }
     }
 }
 
@@ -269,23 +370,63 @@ mod tests {
     #[test]
     fn test_unique_store_basic() {
         let hello: &'static str = "Hello, world!";
-        let mut store = UniqueStrStore::new();
+        let store = UniqueStrStore::new_with_capacity(10);
+        let i = store.insert(hello);
 
-        let stored = store.insert(hello);
         assert_eq!(store.len(), 1, "Store length should be 1");
-        assert!(store.contains(hello), "Store does not contain 'Hello, world!': {store:?}");
+        assert!(store.contains(hello), "Store does not contain '{hello}': {store:?}");
+        assert_eq!(store.get(i).unwrap(), hello, "get(0) should == '{hello}'");
+        assert_eq!(store.get_unchecked(i), hello, "get_unchecked(0) should == '{hello}'");
+    }
 
-        let again = store.insert(hello);
-        let foo = store.insert("foo");
+    #[test]
+    fn test_unique_store_shared() {
+        let hello: &'static str = "Hello, world!";
+        let foo_s: &'static str = "foo";
+        let store = UniqueStrStore::new_with_capacity(10).shared();
+        let stored = store.insert_or_get(hello);
+
+        assert_eq!(store.len(), 1, "Store length should be 1");
+        assert!(store.contains(hello), "Store does not contain '{hello}': {store:?}");
+
+        let again = store.insert_or_get(hello);
+        let foo = store.insert_or_get(foo_s);
         assert_eq!(store.len(), 2, "Store length should be 2");
 
-        assert_eq!(stored.idx(), 0, "'Hello, world!' index should be 0: {stored:?}");
-        assert_eq!(again.idx(), 0, "Second 'Hello, world!' index should be again 0: {again:?}");
-        assert_eq!(foo.idx(), 1, "'foo' index should be 1: {foo:?}");
+        assert_eq!(stored.idx(), 0, "'{hello}' index should be 0: {stored:?}");
+        assert_eq!(again.idx(), 0, "Second '{hello}!' index should be again 0: {again:?}");
+        assert_eq!(foo.idx(), 1, "'{foo_s}' index should be 1: {foo:?}");
 
-        assert_eq!(stored.as_ref(), hello, "as_ref() should == 'Hello, world!': {stored:?}");
+        assert_eq!(stored.as_ref(), hello, "as_ref() should == '{hello}': {stored:?}");
         assert_eq!(stored, again, "StoredStr instances should be equal: {stored:?} != {again:?}");
-        assert_eq!(store.get(0).unwrap(), hello, "get(0) should == 'Hello, world!'");
-        assert_eq!(store.get_unchecked(1), "foo", "get_unchecked(1) should == 'foo'");
+        assert_eq!(store.get(0).unwrap(), hello, "get(0) should == '{hello}'");
+        assert_eq!(store.get_unchecked(1), foo_s, "get_unchecked(1) should == '{foo_s}'");
+    }
+
+    #[test]
+    fn test_concurrent_inserts() {
+        use std::thread;
+
+        let s_num = 100_000;
+        let t_num = 10;
+        let store = UniqueStrStore::new_with_capacity(s_num).shared();
+        let threads: Vec<_> = (0..t_num)
+            .map(|t| {
+                let store = store.clone();
+                thread::spawn(move || {
+                    (0..s_num/t_num).for_each(|i| {
+                        let s = format!("Hello, world! t: {t}, i: {i}");
+                        let stored = store.insert_or_get(&s);
+                        assert_eq!(stored.as_ref(), s, "Stored string should be '{s}': {stored:?}");
+                    })
+                })
+            })
+            .collect();
+
+        for t in threads {
+            t.join().unwrap();
+        }
+
+        assert_eq!(store.len(), s_num, "Stored num should be {s_num}");
     }
 }
