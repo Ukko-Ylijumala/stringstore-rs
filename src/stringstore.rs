@@ -12,6 +12,60 @@ use std::{
     ops::Deref,
 };
 
+/**
+A memory-efficient storage for unique string slices with stable indexing.
+
+[UniqueStrStore] implements a string interning system, which stores only one
+copy of each distinct string. This should significantly reduce memory usage
+in scenarios where many duplicate strings are used.
+
+## Key Features
+- Efficient: each unique string is stored only once.
+- Fast lookups: O(1) average complexity for both index and content-based lookups.
+- Stable indexing: once a string is stored, its index remains constant.
+- Allocations: uses [Box<str>] for heap allocation of strings.
+
+## Design Considerations
+- Uses a [Vec<Box<str>>] for string storage, which should ensure good cache
+  locality and efficient random access.
+- Uses a [HashMap] with `*const str` keys for fast lookups.
+- Custom [xxhash_rust] hasher ([CustomXxh3Hasher]) for potentially faster hashing.
+- No removal operations to guarantee index stability.
+- Not thread-safe.
+
+## Performance Characteristics
+- Insertion: O(1) average
+- Lookup by content: O(1) average
+- Lookup by index: O(1)
+- Memory overhead: small fixed cost per unique string
+
+## Usage
+This structure should work nicely for scenarios where you need to store many
+duplicate strings and require fast lookups by both content and stable indices.
+
+## Safety
+While most operations are safe, the `get_unchecked` method provides an unsafe,
+non-bounds-checking lookup (meant mostly for internal use with known indexes).
+
+## Limitations
+- Does not support string removal to maintain index stability.
+- Not thread-safe.
+
+## Example
+```
+use statter::stringstore::UniqueStrStore;
+
+let mut store = UniqueStrStore::new();
+assert_eq!(store.len(), 0);
+
+let hello: &'static str = "Hello, world!";
+let stored = store.insert(hello);
+
+assert_eq!(stored.idx(), 0);
+assert_eq!(stored.as_ref(), hello);
+assert_eq!(store.get(0).unwrap(), hello);
+assert_ne!(store.get_unchecked(0), "foo");
+*/
 #[derive(Default, Debug, SizeOf)]
 pub struct UniqueStrStore {
     store: Vec<Box<str>>,
@@ -20,8 +74,9 @@ pub struct UniqueStrStore {
 
 impl UniqueStrStore {
     pub fn new() -> Self {
+        let capacity: usize = 64 * 1024; // 65536 entries to start with
         UniqueStrStore {
-            store: Vec::new(),
+            store: Vec::with_capacity(capacity),
             index: HashMap::with_hasher(CustomXxh3Hasher::default().build_hasher()),
         }
     }
