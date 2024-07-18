@@ -34,6 +34,8 @@ in scenarios where many duplicate strings are used.
 - Custom [xxhash_rust] hasher ([CustomXxh3Hasher]) for potentially faster hashing.
 - Thread-safe due to wrapping storage/index fields with [RwLock]s.
 - trait [SharedStrStore]: is used to lock certain methods behind a shared reference.
+- trait [SizeOf]: provides a way to measure the size of the structure in memory.
+- the empty string ("") always occupies the first index (0).
 
 ## Performance Characteristics
 - Insertion: O(1) average
@@ -65,15 +67,15 @@ let hello: &'static str = "Hello, world!";
 let store = UniqueStrStore::new();
 
 store.insert(hello);
-assert_eq!(store.len(), 1);
+assert_eq!(store.len(), 2);
 assert!(store.contains(hello));
 
 store.insert(hello);
 store.insert("foo");
-assert_eq!(store.len(), 2);
-assert_eq!(store.get(0).unwrap(), hello);
+assert_eq!(store.len(), 3);
+assert_eq!(store.get(1).unwrap(), hello);
 // unsafe if the index is out of bounds
-assert_eq!(unsafe { store.get_unchecked(1) }, "foo");
+assert_eq!(unsafe { store.get_unchecked(2) }, "foo");
 */
 #[derive(Default, Debug)]
 pub struct UniqueStrStore {
@@ -82,18 +84,24 @@ pub struct UniqueStrStore {
 }
 
 impl UniqueStrStore {
+    /// Create a new [UniqueStrStore] with a default capacity of 128.
     pub fn new() -> Self {
         Self::new_with_capacity(128)
     }
 
     pub fn new_with_capacity(capacity: usize) -> Self {
+        let mut store: Vec<Box<str>> = Vec::with_capacity(capacity);
+        let mut index =
+            HashMap::with_capacity_and_hasher(capacity, CustomXxh3Hasher::default().build_hasher());
+
+        // The first index is always the empty string.
+        let empty: &str = "";
+        store.push(empty.into());
+        index.insert(hash_bytes(empty.as_bytes()), 0);
+
         UniqueStrStore {
-            store: Vec::with_capacity(capacity).into(),
-            index: HashMap::with_capacity_and_hasher(
-                capacity,
-                CustomXxh3Hasher::default().build_hasher(),
-            )
-            .into(),
+            store: store.into(),
+            index: index.into(),
         }
     }
 
@@ -186,6 +194,9 @@ impl UniqueStrStore {
         T: Into<String>,
     {
         let s: String = s.into();
+        if s.is_empty() {
+            return 0;
+        }
         if let Some(idx) = self.idx(&s) {
             idx
         } else {
@@ -291,6 +302,9 @@ impl SharedStrStore for Arc<UniqueStrStore> {
         T: Into<String>,
     {
         let s: String = s.into();
+        if s.is_empty() {
+            return StoredStr(0, self.clone());
+        }
         if !self.contains(&s) {
             self.insert_unchecked(s.clone());
         }
@@ -434,16 +448,17 @@ mod tests {
     #[test]
     fn test_unique_store_basic() {
         let hello: &'static str = "Hello, world!";
-        let store = UniqueStrStore::new_with_capacity(10);
-        let i = store.insert(hello);
+        let store: UniqueStrStore = UniqueStrStore::new_with_capacity(10);
+        let i: u32 = store.insert(hello);
+        let num: usize = i as usize + 1;
 
-        assert_eq!(store.len(), 1, "Store length should be 1");
+        assert_eq!(store.len(), num, "Store length should be {num}");
         assert!(store.contains(hello), "Store does not contain '{hello}': {store:?}");
-        assert_eq!(store.get(i).unwrap(), hello, "get(0) should == '{hello}'");
+        assert_eq!(store.get(i).unwrap(), hello, "get({i}) should == '{hello}'");
         assert_eq!(
             unsafe { store.get_unchecked(i) },
             hello,
-            "get_unchecked(0) should == '{hello}'"
+            "get_unchecked({i}) should == '{hello}'"
         );
     }
 
@@ -451,27 +466,29 @@ mod tests {
     fn test_unique_store_shared() {
         let hello: &'static str = "Hello, world!";
         let foo_s: &'static str = "foo";
-        let store = UniqueStrStore::new_with_capacity(10).shared();
-        let stored = store.insert_or_get(hello);
+        let store: Arc<UniqueStrStore> = UniqueStrStore::new_with_capacity(10).shared();
+        let stored: StoredStr = store.insert_or_get(hello);
+        let start: u32 = 1;
 
-        assert_eq!(store.len(), 1, "Store length should be 1");
+        assert_eq!(store.len(), start as usize + 1, "Store length should be {}", start + 1);
         assert!(store.contains(hello), "Store does not contain '{hello}': {store:?}");
 
-        let again = store.insert_or_get(hello);
-        let foo = store.insert_or_get(foo_s);
-        assert_eq!(store.len(), 2, "Store length should be 2");
+        let again: StoredStr = store.insert_or_get(hello);
+        let foo: StoredStr = store.insert_or_get(foo_s);
+        assert_eq!(store.len(), start as usize + 2, "Store length should be {}", start + 2);
 
-        assert_eq!(stored.idx(), 0, "'{hello}' index should be 0: {stored:?}");
-        assert_eq!(again.idx(), 0, "Second '{hello}!' index should be again 0: {again:?}");
-        assert_eq!(foo.idx(), 1, "'{foo_s}' index should be 1: {foo:?}");
+        assert_eq!(stored.idx(), start, "'{hello}' idx should be {start}: {stored:?}");
+        assert_eq!(again.idx(), start, "Second '{hello}!' idx should be again {start}: {again:?}");
+        assert_eq!(foo.idx(), start + 1, "'{foo_s}' idx should be {}: {foo:?}", start + 1);
 
         assert_eq!(stored.as_ref(), hello, "as_ref() should == '{hello}': {stored:?}");
         assert_eq!(stored, again, "StoredStr instances should be equal: {stored:?} != {again:?}");
-        assert_eq!(store.get(0).unwrap(), hello, "get(0) should == '{hello}'");
+        assert_eq!(store.get(start).unwrap(), hello, "get({start}) should == '{hello}'");
         assert_eq!(
-            unsafe { store.get_unchecked(1) },
+            unsafe { store.get_unchecked(start + 1) },
             foo_s,
-            "get_unchecked(1) should == '{foo_s}'"
+            "get_unchecked({}) should == '{foo_s}'",
+            start + 1
         );
     }
 
@@ -479,16 +496,16 @@ mod tests {
     fn test_concurrent_inserts() {
         use std::thread;
 
-        let s_num = 100_000;
-        let t_num = 10;
-        let store = UniqueStrStore::new_with_capacity(s_num).shared();
+        let s_num: usize = 100_000;
+        let t_num: usize = 10;
+        let store: Arc<UniqueStrStore> = UniqueStrStore::new_with_capacity(s_num).shared();
         let threads: Vec<_> = (0..t_num)
-            .map(|t| {
+            .map(|t: usize| {
                 let store = store.clone();
                 thread::spawn(move || {
-                    (0..s_num / t_num).for_each(|i| {
-                        let s = format!("Hello, world! t: {t}, i: {i}");
-                        let stored = store.insert_or_get(&s);
+                    (0..s_num / t_num).for_each(|i: usize| {
+                        let s: String = format!("Hello, world! t: {t}, i: {i}");
+                        let stored: StoredStr = store.insert_or_get(&s);
                         assert_eq!(stored.as_ref(), s, "Stored string should be '{s}': {stored:?}");
                     })
                 })
@@ -500,6 +517,6 @@ mod tests {
         }
 
         store.validate_contents().ok(); // will panic on failure in debug mode
-        assert_eq!(store.len(), s_num, "Stored num should be {s_num}");
+        assert_eq!(store.len(), s_num + 1, "Stored num should be {}", s_num + 1);
     }
 }
