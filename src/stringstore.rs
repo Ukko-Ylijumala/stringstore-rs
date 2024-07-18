@@ -11,6 +11,7 @@ use std::{
     fmt::{self, Debug, Display, Formatter},
     hash::{BuildHasher, Hash, Hasher},
     ops::Deref,
+    str::Split,
     sync::Arc,
 };
 
@@ -202,6 +203,92 @@ impl UniqueStrStore {
         } else {
             self.insert_unchecked(s)
         }
+    }
+
+    /**
+    Splits a string by a delimiter, stores each part and the delimiter,
+    and returns a Vec of part indices in the same order, plus the delimiter
+    index separately.
+
+    The index 0 (empty string) in the returned Vec means:
+    - at start/end: delimiter found at start/end of the string
+    - elsewhere: 2 contiguous delimiters (or more with subsequent zero indices)
+    */
+    pub fn split_and_store(&self, s: &str, delim: &str) -> (Vec<u32>, u32) {
+        if s.is_empty() {
+            // special case: empty string
+            return (vec![0], self.insert(delim));
+        }
+
+        let mut result: Vec<u32> = Vec::new();
+        let mut parts: Split<&str> = s.split(delim);
+
+        // Store the delimiter first
+        let delim_idx: u32 = match delim.is_empty() {
+            true => 0,
+            false => self.insert(delim),
+        };
+
+        // Store each part and collect its index
+        while let Some(part) = parts.next() {
+            if part.is_empty() {
+                // empty string here means one of the following:
+                // - 2 contiguous delimiters
+                // - delimiter at the start or end of the string
+                result.push(0);
+            } else {
+                result.push(self.insert(part));
+            }
+        }
+
+        (result, delim_idx)
+    }
+
+    /**
+    Reconstruct a string from stored parts' and delimiter indices.
+    Returns an error if any index is out of bounds.
+
+    The same effect can be achieved by something like:
+    ```ignore
+    let built: String = indices
+        .iter()
+        .map(|&idx| store.get(idx).unwrap())
+        .collect::<Vec<&str>>()
+        .join(store.get(delim).unwrap());
+    */
+    pub fn reconstruct(&self, indices: &[u32], delim: u32) -> Result<String, String> {
+        let parts_num: usize = indices.len();
+        // special case: empty string
+        if parts_num == 0 || (parts_num == 1 && indices[0] == 0) {
+            return Ok("".to_string());
+        } else if parts_num >= u32::MAX as usize {
+            return Err("Size is larger than u32::MAX - 1".to_string());
+        }
+
+        // delimiter check
+        let store = self.store.read();
+        let stored_num: u32 = store.len() as u32;
+        if delim >= stored_num {
+            return Err("Delimiter index {idx} out of bounds".to_string());
+        }
+
+        // construct the string
+        let delim_str: &Box<str> = &store[delim as usize];
+        let mut result: String = String::new();
+        for (i, idx) in indices.iter().enumerate() {
+            if idx >= &stored_num {
+                return Err("String index {idx} (pos: {i}) out of bounds".to_string());
+            }
+            if idx != &0 {
+                result.push_str(&store[*idx as usize]);
+            }
+            if i < parts_num - 1 {
+                // no delimiter after the last part
+                result.push_str(delim_str);
+            }
+        }
+
+        Ok(result)
     }
 
     /**
@@ -518,5 +605,63 @@ mod tests {
 
         store.validate_contents().ok(); // will panic on failure in debug mode
         assert_eq!(store.len(), s_num + 1, "Stored num should be {}", s_num + 1);
+    }
+
+    #[test]
+    fn test_split_and_store() {
+        let store: UniqueStrStore = UniqueStrStore::new();
+        let input: &str = ",apple,banana,cherry,cake,,cake,,,";
+        let delim: &str = ",";
+        let mut exp_len: usize = 6; // 4 uniq parts + 1 delim + 1 empty string
+
+        let (indices, d) = store.split_and_store(input, delim);
+        assert_eq!(indices.len(), 10);
+        assert_eq!(store.len(), exp_len);
+
+        // Check that the delimiter is stored
+        assert!(store.contains(delim), "Store should contain the delim: '{delim}'");
+        assert_eq!(store.get(d).unwrap(), delim);
+
+        assert_eq!(store.get(indices[0]).unwrap(), "");
+        assert_eq!(store.get(indices[1]).unwrap(), "apple");
+        assert_eq!(store.get(indices[2]).unwrap(), "banana");
+        assert_eq!(store.get(indices[3]).unwrap(), "cherry");
+        assert_eq!(store.get(indices[4]).unwrap(), "cake");
+        assert_eq!(store.get(indices[5]).unwrap(), "");
+        assert_eq!(store.get(indices[6]).unwrap(), "cake");
+        assert_eq!(store.get(indices[7]).unwrap(), "");
+        assert_eq!(store.get(indices[8]).unwrap(), "");
+        assert_eq!(store.get(indices[9]).unwrap(), "");
+
+        // Check that the original string can be reconstructed
+        let built: String = indices
+            .iter()
+            .map(|&idx| unsafe { store.get_unchecked(idx) })
+            .collect::<Vec<&str>>()
+            .join(delim);
+
+        assert_eq!(input, built, "Reconstructed string should be '{input}'");
+        assert_eq!(
+            input,
+            store.reconstruct(&indices, d).unwrap(),
+            "input <-> reconstruct() mismatch"
+        );
+
+        // Check for incorrect delimiter handling
+        let delim: &str = ";";
+        let (indices, d) = store.split_and_store(input, delim);
+        exp_len += 2; // 1 new delim + 1 new part
+        assert_eq!(indices.len(), 1);
+        assert_eq!(store.len(), exp_len);
+        assert_eq!(store.get(d).unwrap(), delim, "Store should have the next delim: '{delim}'");
+        assert!(store.contains(input), "Store should contain '{input}' (not split)");
+
+        assert_eq!(
+            input,
+            store.reconstruct(&indices, d).unwrap(),
+            "input <-> reconstruct() mismatch (not split)"
+        );
+
+        store.validate_contents().ok();
     }
 }
