@@ -28,11 +28,12 @@ in scenarios where many duplicate strings are used.
 - Allocations: uses [Box<str>] for heap allocation of strings.
 
 ## Design Considerations
-- Uses a [Vec<Box<str>>] for string storage, which should ensure good cache
-  locality and efficient random access.
+- Uses a [Vec<Box<str>>] for string storage, which is efficient for random access,
+  and should help with cache locality as well.
 - Uses a [HashMap] with `u64` Xxh3 string hashes as keys for fast lookups.
 - Custom [xxhash_rust] hasher ([CustomXxh3Hasher]) for potentially faster hashing.
 - Thread-safe due to wrapping storage/index fields with [RwLock]s.
+- trait [SharedStrStore]: is used to lock certain methods behind a shared reference.
 
 ## Performance Characteristics
 - Insertion: O(1) average
@@ -71,7 +72,8 @@ store.insert(hello);
 store.insert("foo");
 assert_eq!(store.len(), 2);
 assert_eq!(store.get(0).unwrap(), hello);
-assert_eq!(store.get_unchecked(1), "foo");
+// unsafe if the index is out of bounds
+assert_eq!(unsafe { store.get_unchecked(1) }, "foo");
 */
 #[derive(Default, Debug)]
 pub struct UniqueStrStore {
@@ -124,7 +126,7 @@ impl UniqueStrStore {
             None
         } else {
             drop(store); // must release the lock to avoid a deadlock
-            Some(self.get_unchecked(idx))
+            unsafe { Some(self.get_unchecked(idx)) }
         }
     }
 
@@ -148,13 +150,11 @@ impl UniqueStrStore {
     std::str::from_utf8_unchecked(bytes)
     */
     #[inline]
-    pub fn get_unchecked<'a>(&'a self, idx: u32) -> &'a str {
+    pub unsafe fn get_unchecked<'a>(&'a self, idx: u32) -> &'a str {
         let store = self.store.read();
-        unsafe {
-            let b: &Box<str> = store.get_unchecked(idx as usize);
-            let ptr = b.as_ref() as *const str;
-            &*ptr
-        }
+        let b: &Box<str> = store.get_unchecked(idx as usize);
+        let ptr: *const str = b.as_ref() as *const str;
+        &*ptr
     }
 
     /**
@@ -191,6 +191,67 @@ impl UniqueStrStore {
         } else {
             self.insert_unchecked(s)
         }
+    }
+
+    /**
+    Validate the contents of the store and index.
+
+    ### Release mode
+    Returns a list of errors if any are found.
+
+    ### Debug mode
+    Panics with the error list if any are found.
+    */
+    pub fn validate_contents(&self) -> Result<(), Vec<String>> {
+        // we want exclusive locks for validation to ensure consistency
+        let store = self.store.write();
+        let index = self.index.write();
+        let mut errs: Vec<String> = Vec::new();
+
+        let l_store: usize = store.len();
+        let l_index: usize = index.len();
+        if l_store != l_index {
+            errs.push(format!("store.len() ({l_store}) != index.len() ({l_index})"));
+        };
+
+        // Check that each store entry has a corresponding index.
+        for (sid, s) in store.iter().enumerate() {
+            let key: u64 = hash_bytes(s.as_bytes());
+            if !index.contains_key(&key) {
+                errs.push(format!("missing hash: 0x{key:x} (str_id: {sid}, str: '{s}')"));
+            };
+            let found: u32 = index[&key];
+            if found != sid as u32 {
+                errs.push(format!(
+                    "index mismatch for str_id {sid} ('{s}'): hash 0x{key:x} -> {found} ('{}')",
+                    &*store[found as usize]
+                ));
+            }
+        }
+
+        // Check that each index is valid wrt. the store.
+        for (key, sid) in index.iter() {
+            if (*sid as usize) >= l_store {
+                errs.push(format!("index out of bounds: {sid} >= {l_store} (hash: 0x{key:x})"));
+            }
+            let s: &Box<str> = unsafe { store.get_unchecked(*sid as usize) };
+            let csum: u64 = hash_bytes(s.as_bytes());
+            if csum != *key {
+                errs.push(format!(
+                    "hash mismatch for '{s}' (stored: 0x{key:x}, calculated: 0x{csum:x})"
+                ));
+            }
+        }
+
+        #[cfg(debug_assertions)]
+        if !errs.is_empty() {
+            panic!("UniqueStrStore validation failed:\n{}", errs.join("\n"));
+        }
+
+        if !errs.is_empty() {
+            return Err(errs);
+        }
+        Ok(())
     }
 }
 
@@ -253,8 +314,9 @@ pub struct StoredStr(u32, Arc<UniqueStrStore>);
 
 impl StoredStr {
     #[inline]
+    /// This method is safe to call, as our reference is guaranteed to be valid.
     fn reference(&self) -> &str {
-        (*self.1).get_unchecked(self.0)
+        unsafe { (*self.1).get_unchecked(self.0) }
     }
 
     /// Get the index of the stored string slice.
@@ -356,8 +418,10 @@ impl<'a> From<StoredStr> for u32 {
 
 impl<'a> From<StoredStr> for &'a str {
     fn from(v: StoredStr) -> &'a str {
-        let ptr = (*v.1).get_unchecked(v.0) as *const str;
-        unsafe { &*ptr }
+        unsafe {
+            let ptr: *const str = (*v.1).get_unchecked(v.0) as *const str;
+            &*ptr
+        }
     }
 }
 
@@ -376,7 +440,11 @@ mod tests {
         assert_eq!(store.len(), 1, "Store length should be 1");
         assert!(store.contains(hello), "Store does not contain '{hello}': {store:?}");
         assert_eq!(store.get(i).unwrap(), hello, "get(0) should == '{hello}'");
-        assert_eq!(store.get_unchecked(i), hello, "get_unchecked(0) should == '{hello}'");
+        assert_eq!(
+            unsafe { store.get_unchecked(i) },
+            hello,
+            "get_unchecked(0) should == '{hello}'"
+        );
     }
 
     #[test]
@@ -400,7 +468,11 @@ mod tests {
         assert_eq!(stored.as_ref(), hello, "as_ref() should == '{hello}': {stored:?}");
         assert_eq!(stored, again, "StoredStr instances should be equal: {stored:?} != {again:?}");
         assert_eq!(store.get(0).unwrap(), hello, "get(0) should == '{hello}'");
-        assert_eq!(store.get_unchecked(1), foo_s, "get_unchecked(1) should == '{foo_s}'");
+        assert_eq!(
+            unsafe { store.get_unchecked(1) },
+            foo_s,
+            "get_unchecked(1) should == '{foo_s}'"
+        );
     }
 
     #[test]
@@ -414,7 +486,7 @@ mod tests {
             .map(|t| {
                 let store = store.clone();
                 thread::spawn(move || {
-                    (0..s_num/t_num).for_each(|i| {
+                    (0..s_num / t_num).for_each(|i| {
                         let s = format!("Hello, world! t: {t}, i: {i}");
                         let stored = store.insert_or_get(&s);
                         assert_eq!(stored.as_ref(), s, "Stored string should be '{s}': {stored:?}");
@@ -427,6 +499,7 @@ mod tests {
             t.join().unwrap();
         }
 
+        store.validate_contents().ok(); // will panic on failure in debug mode
         assert_eq!(store.len(), s_num, "Stored num should be {s_num}");
     }
 }
