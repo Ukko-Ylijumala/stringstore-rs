@@ -3,6 +3,7 @@
 #![allow(dead_code)]
 
 use crate::hashing::{hash_bytes, CustomXxh3Hasher};
+use crate::utils::normalize_path;
 use parking_lot::RwLock;
 use size_of::{Context, SizeOf};
 use std::{
@@ -11,9 +12,13 @@ use std::{
     fmt::{self, Debug, Display, Formatter},
     hash::{BuildHasher, Hash, Hasher},
     ops::Deref,
+    path::{Path, PathBuf},
     str::Split,
     sync::Arc,
 };
+
+const EMPTY_STR: &str = "";
+const PATH_SEP: &str = "/";
 
 /**
 A memory-efficient storage for unique string slices with stable indexing.
@@ -96,9 +101,8 @@ impl UniqueStrStore {
             HashMap::with_capacity_and_hasher(capacity, CustomXxh3Hasher::default().build_hasher());
 
         // The first index is always the empty string.
-        let empty: &str = "";
-        store.push(empty.into());
-        index.insert(hash_bytes(empty.as_bytes()), 0);
+        store.push(EMPTY_STR.into());
+        index.insert(hash_bytes(EMPTY_STR.as_bytes()), 0);
 
         UniqueStrStore {
             store: store.into(),
@@ -205,9 +209,26 @@ impl UniqueStrStore {
         }
     }
 
+    /// Store the parts and return their indices.
+    fn store_parts(&self, s: &str, delim: &str) -> Vec<u32> {
+        let mut result: Vec<u32> = Vec::new();
+        let mut parts: Split<&str> = s.split(delim);
+        while let Some(part) = parts.next() {
+            if part.is_empty() {
+                // empty string here means one of the following:
+                // - 2 contiguous delimiters
+                // - delimiter at the start or end of the string
+                result.push(0);
+            } else {
+                result.push(self.insert(part));
+            }
+        }
+        result
+    }
+
     /**
     Splits a string by a delimiter, stores each part and the delimiter,
-    and returns a Vec of part indices in the same order, plus the delimiter
+    and returns a [Vec] of part indices in the same order, plus the delimiter
     index separately.
 
     The index 0 (empty string) in the returned Vec means:
@@ -220,28 +241,43 @@ impl UniqueStrStore {
             return (vec![0], self.insert(delim));
         }
 
-        let mut result: Vec<u32> = Vec::new();
-        let mut parts: Split<&str> = s.split(delim);
-
         // Store the delimiter first
         let delim_idx: u32 = match delim.is_empty() {
             true => 0,
             false => self.insert(delim),
         };
 
-        // Store each part and collect its index
-        while let Some(part) = parts.next() {
-            if part.is_empty() {
-                // empty string here means one of the following:
-                // - 2 contiguous delimiters
-                // - delimiter at the start or end of the string
-                result.push(0);
-            } else {
-                result.push(self.insert(part));
-            }
-        }
+        (self.store_parts(s, delim), delim_idx)
+    }
 
-        (result, delim_idx)
+    /**
+    Insert a new string (which can be coerced into a [Path]) and return
+    a [Vec] of parts' indices. The delimiter is assumed to be a '/'.
+
+    NOTE: the path will be normalized before storing, hence the result may
+    not be the same as the input if it contains relative paths, escape
+    sequences or control characters.
+
+    NOTE: non-unicode sequences will be replaced with the replacement
+    character [`U+FFFD REPLACEMENT CHARACTER`][U+FFFD].
+
+    NOTE: if `index[0] == 0` && `index.len() > 1`, it means that the path is
+    absolute and starts with "delimiter", in this case the forward slash.
+    Especially, for the root path ('/'), the resultant Vec is `[0, 0]`.
+
+    [U+FFFD]: core::char::REPLACEMENT_CHARACTER
+    */
+    pub fn store_path<P>(&self, s: P) -> Vec<u32>
+    where
+        P: AsRef<Path>,
+    {
+        self.insert(PATH_SEP);
+        let s: PathBuf = normalize_path(s);
+        if s.as_os_str().is_empty() {
+            return [0].into();
+        }
+        // we can unwrap safely, as the path is guaranteed to be valid
+        self.store_parts(s.to_str().unwrap(), PATH_SEP)
     }
 
     /**
@@ -260,7 +296,7 @@ impl UniqueStrStore {
         let parts_num: usize = indices.len();
         // special case: empty string
         if parts_num == 0 || (parts_num == 1 && indices[0] == 0) {
-            return Ok("".to_string());
+            return Ok(EMPTY_STR.to_string());
         } else if parts_num >= u32::MAX as usize {
             return Err("Size is larger than u32::MAX - 1".to_string());
         }
@@ -484,7 +520,7 @@ impl Hash for StoredStr {
 
 impl Debug for StoredStr {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "StoredStr({}: {})", self.idx(), self.reference())
+        write!(f, "StoredStr({}: {:?})", self.0, self.reference())
     }
 }
 
@@ -607,31 +643,28 @@ mod tests {
         assert_eq!(store.len(), s_num + 1, "Stored num should be {}", s_num + 1);
     }
 
+    #[rustfmt::skip]
     #[test]
     fn test_split_and_store() {
         let store: UniqueStrStore = UniqueStrStore::new();
         let input: &str = ",apple,banana,cherry,cake,,cake,,,";
+        let exp_v: Vec<&str> = vec!["", "apple", "banana", "cherry", "cake", "", "cake", "", "", ""];
         let delim: &str = ",";
         let mut exp_len: usize = 6; // 4 uniq parts + 1 delim + 1 empty string
 
         let (indices, d) = store.split_and_store(input, delim);
-        assert_eq!(indices.len(), 10);
+        assert_eq!(indices.len(), 10, "{indices:?}");
         assert_eq!(store.len(), exp_len);
 
         // Check that the delimiter is stored
         assert!(store.contains(delim), "Store should contain the delim: '{delim}'");
         assert_eq!(store.get(d).unwrap(), delim);
 
-        assert_eq!(store.get(indices[0]).unwrap(), "");
-        assert_eq!(store.get(indices[1]).unwrap(), "apple");
-        assert_eq!(store.get(indices[2]).unwrap(), "banana");
-        assert_eq!(store.get(indices[3]).unwrap(), "cherry");
-        assert_eq!(store.get(indices[4]).unwrap(), "cake");
-        assert_eq!(store.get(indices[5]).unwrap(), "");
-        assert_eq!(store.get(indices[6]).unwrap(), "cake");
-        assert_eq!(store.get(indices[7]).unwrap(), "");
-        assert_eq!(store.get(indices[8]).unwrap(), "");
-        assert_eq!(store.get(indices[9]).unwrap(), "");
+        // Check that the parts are stored correctly
+        for (i, &idx) in indices.iter().enumerate() {
+            let exp: &str = exp_v[i];
+            assert_eq!(store.get(idx).unwrap(), exp, "index {i} fail: '{exp}'",);
+        }
 
         // Check that the original string can be reconstructed
         let built: String = indices
@@ -647,11 +680,13 @@ mod tests {
             "input <-> reconstruct() mismatch"
         );
 
+        /* --------------------------------- */
+
         // Check for incorrect delimiter handling
         let delim: &str = ";";
         let (indices, d) = store.split_and_store(input, delim);
         exp_len += 2; // 1 new delim + 1 new part
-        assert_eq!(indices.len(), 1);
+        assert_eq!(indices.len(), 1, "{indices:?}");
         assert_eq!(store.len(), exp_len);
         assert_eq!(store.get(d).unwrap(), delim, "Store should have the next delim: '{delim}'");
         assert!(store.contains(input), "Store should contain '{input}' (not split)");
@@ -663,5 +698,88 @@ mod tests {
         );
 
         store.validate_contents().ok();
+    }
+
+    #[rustfmt::skip]
+    #[test]
+    fn test_store_path() {
+        let store: UniqueStrStore = UniqueStrStore::new();
+        let path1: &str = "/home/user/foo/bar/garbage.txt";
+        let exp_1: Vec<&str> = vec!["", "home", "user", "foo", "bar", "garbage.txt"];
+        let parts1: Vec<u32> = store.store_path(path1);
+
+        // 5 uniq parts + 1 delim + 1 empty string
+        let mut exp_len: usize = 7;
+        // 6 returned indices expected, not 5, since it includes the
+        // empty string at the 1st index, as this is an absolute path
+        assert_eq!(parts1.len(), 6, "{parts1:?}");
+        assert_eq!(store.len(), exp_len);
+
+        // Check that the delimiter is stored
+        assert!(store.contains(PATH_SEP), "Store should contain the delim: '{PATH_SEP}'");
+
+        // Check that the parts are stored correctly
+        for (i, &idx) in parts1.iter().enumerate() {
+            let exp: &str = exp_1[i];
+            assert_eq!(store.get(idx).unwrap(), exp, "parts1 {i} fail: '{exp}'",);
+        }
+
+        // Check that the original string can be reconstructed
+        let built: String = parts1
+            .iter()
+            .map(|&idx| unsafe { store.get_unchecked(idx) })
+            .collect::<Vec<&str>>()
+            .join(PATH_SEP);
+
+        assert_eq!(path1, built, "Reconstructed path should be '{path1}'");
+        assert_eq!(
+            path1,
+            store.reconstruct(&parts1, store.idx(PATH_SEP).unwrap()).unwrap(),
+            "input <-> reconstruct() mismatch (path1)"
+        );
+
+        /* --------------------------------- */
+
+        // Check for canonicalized path handling
+        let path2: &str = "/home/user/./..../foo/../bar/garbage2.txt";
+        let exp_2: Vec<&str> = vec!["", "home", "user", "bar", "garbage2.txt"];
+        let parts2: Vec<u32> = store.store_path(path2);
+
+        exp_len += 1; // 1 new part, as the "dots" should be normalized away
+        assert_eq!(parts2.len(), 5, "{parts2:?}");
+        assert_eq!(store.len(), exp_len);
+
+        for (i, &idx) in parts2.iter().enumerate() {
+            let exp: &str = exp_2[i];
+            assert_eq!(store.get(idx).unwrap(), exp, "parts2 {i} fail: '{exp}'",);
+        }
+
+        assert_eq!(
+            "/home/user/bar/garbage2.txt",
+            store.reconstruct(&parts2, store.idx(PATH_SEP).unwrap()).unwrap(),
+            "input <-> reconstruct() mismatch (path2)"
+        );
+
+        /* --------------------------------- */
+
+        // Check for relative path handling
+        let path3: &str = "veri/sekrit/.///hidn/../lokas\0juun/garbage.1";
+        let exp_3: Vec<&str> = vec!["veri", "sekrit", "lokasjuun", "garbage.1"];
+        let parts3: Vec<u32> = store.store_path(path3);
+
+        exp_len += 4;
+        assert_eq!(parts3.len(), 4, "{parts3:?}");
+        assert_eq!(store.len(), exp_len);
+
+        for (i, &idx) in parts3.iter().enumerate() {
+            let exp: &str = exp_3[i];
+            assert_eq!(store.get(idx).unwrap(), exp, "parts3 {i} fail: '{exp}'",);
+        }
+
+        assert_eq!(
+            "veri/sekrit/lokasjuun/garbage.1",
+            store.reconstruct(&parts3, store.idx(PATH_SEP).unwrap()).unwrap(),
+            "input <-> reconstruct() mismatch (path3)"
+        );
     }
 }
