@@ -568,45 +568,47 @@ mod tests {
     #[allow(unused_imports)]
     use super::*;
 
+    const HELLO: &str = "Hello, world!";
+    const CONC_S_NUM: usize = 100_000;
+    const CONC_T_NUM: usize = 10;
+
     #[test]
     fn test_unique_store_basic() {
-        let hello: &'static str = "Hello, world!";
         let store: UniqueStrStore = UniqueStrStore::new_with_capacity(10);
-        let i: u32 = store.insert(hello);
+        let i: u32 = store.insert(HELLO);
         let num: usize = i as usize + 1;
 
         assert_eq!(store.len(), num, "Store length should be {num}");
-        assert!(store.contains(hello), "Store does not contain '{hello}': {store:?}");
-        assert_eq!(store.get(i).unwrap(), hello, "get({i}) should == '{hello}'");
+        assert!(store.contains(HELLO), "Store does not contain '{HELLO}': {store:?}");
+        assert_eq!(store.get(i).unwrap(), HELLO, "get({i}) should == '{HELLO}'");
         assert_eq!(
             unsafe { store.get_unchecked(i) },
-            hello,
-            "get_unchecked({i}) should == '{hello}'"
+            HELLO,
+            "get_unchecked({i}) should == '{HELLO}'"
         );
     }
 
     #[test]
     fn test_unique_store_shared() {
-        let hello: &'static str = "Hello, world!";
         let foo_s: &'static str = "foo";
         let store: Arc<UniqueStrStore> = UniqueStrStore::new_with_capacity(10).shared();
-        let stored: StoredStr = store.insert_or_get(hello);
+        let stored: StoredStr = store.insert_or_get(HELLO);
         let start: u32 = 1;
 
         assert_eq!(store.len(), start as usize + 1, "Store length should be {}", start + 1);
-        assert!(store.contains(hello), "Store does not contain '{hello}': {store:?}");
+        assert!(store.contains(HELLO), "Store does not contain '{HELLO}': {store:?}");
 
-        let again: StoredStr = store.insert_or_get(hello);
+        let again: StoredStr = store.insert_or_get(HELLO);
         let foo: StoredStr = store.insert_or_get(foo_s);
         assert_eq!(store.len(), start as usize + 2, "Store length should be {}", start + 2);
 
-        assert_eq!(stored.idx(), start, "'{hello}' idx should be {start}: {stored:?}");
-        assert_eq!(again.idx(), start, "Second '{hello}!' idx should be again {start}: {again:?}");
+        assert_eq!(stored.idx(), start, "'{HELLO}' idx should be {start}: {stored:?}");
+        assert_eq!(again.idx(), start, "Second '{HELLO}!' idx should be again {start}: {again:?}");
         assert_eq!(foo.idx(), start + 1, "'{foo_s}' idx should be {}: {foo:?}", start + 1);
 
-        assert_eq!(stored.as_ref(), hello, "as_ref() should == '{hello}': {stored:?}");
+        assert_eq!(stored.as_ref(), HELLO, "as_ref() should == '{HELLO}': {stored:?}");
         assert_eq!(stored, again, "StoredStr instances should be equal: {stored:?} != {again:?}");
-        assert_eq!(store.get(start).unwrap(), hello, "get({start}) should == '{hello}'");
+        assert_eq!(store.get(start).unwrap(), HELLO, "get({start}) should == '{HELLO}'");
         assert_eq!(
             unsafe { store.get_unchecked(start + 1) },
             foo_s,
@@ -619,15 +621,13 @@ mod tests {
     fn test_concurrent_inserts() {
         use std::thread;
 
-        let s_num: usize = 100_000;
-        let t_num: usize = 10;
-        let store: Arc<UniqueStrStore> = UniqueStrStore::new_with_capacity(s_num).shared();
-        let threads: Vec<_> = (0..t_num)
+        let store: Arc<UniqueStrStore> = UniqueStrStore::new_with_capacity(CONC_S_NUM).shared();
+        let threads: Vec<_> = (0..CONC_T_NUM)
             .map(|t: usize| {
                 let store = store.clone();
                 thread::spawn(move || {
-                    (0..s_num / t_num).for_each(|i: usize| {
-                        let s: String = format!("Hello, world! t: {t}, i: {i}");
+                    (0..CONC_S_NUM / CONC_T_NUM).for_each(|i: usize| {
+                        let s: String = format!("{HELLO} t: {t}, i: {i}");
                         let stored: StoredStr = store.insert_or_get(&s);
                         assert_eq!(stored.as_ref(), s, "Stored string should be '{s}': {stored:?}");
                     })
@@ -640,7 +640,7 @@ mod tests {
         }
 
         store.validate_contents().ok(); // will panic on failure in debug mode
-        assert_eq!(store.len(), s_num + 1, "Stored num should be {}", s_num + 1);
+        assert_eq!(store.len(), CONC_S_NUM + 1, "Stored num should be {}", CONC_S_NUM + 1);
     }
 
     #[rustfmt::skip]
@@ -650,11 +650,11 @@ mod tests {
         let input: &str = ",apple,banana,cherry,cake,,cake,,,";
         let exp_v: Vec<&str> = vec!["", "apple", "banana", "cherry", "cake", "", "cake", "", "", ""];
         let delim: &str = ",";
-        let mut exp_len: usize = 6; // 4 uniq parts + 1 delim + 1 empty string
+        let mut exp_store_len: usize = 6; // 4 uniq parts + 1 delim + 1 empty string
 
         let (indices, d) = store.split_and_store(input, delim);
-        assert_eq!(indices.len(), 10, "{indices:?}");
-        assert_eq!(store.len(), exp_len);
+        assert_eq!(indices.len(), exp_v.len(), "{indices:?}");
+        assert_eq!(store.len(), exp_store_len);
 
         // Check that the delimiter is stored
         assert!(store.contains(delim), "Store should contain the delim: '{delim}'");
@@ -663,7 +663,7 @@ mod tests {
         // Check that the parts are stored correctly
         for (i, &idx) in indices.iter().enumerate() {
             let exp: &str = exp_v[i];
-            assert_eq!(store.get(idx).unwrap(), exp, "index {i} fail: '{exp}'",);
+            assert_eq!(store.get(idx).unwrap(), exp, "index {i}: '{exp}'");
         }
 
         // Check that the original string can be reconstructed
@@ -685,9 +685,9 @@ mod tests {
         // Check for incorrect delimiter handling
         let delim: &str = ";";
         let (indices, d) = store.split_and_store(input, delim);
-        exp_len += 2; // 1 new delim + 1 new part
+        exp_store_len += 2; // 1 new delim + 1 new part
         assert_eq!(indices.len(), 1, "{indices:?}");
-        assert_eq!(store.len(), exp_len);
+        assert_eq!(store.len(), exp_store_len);
         assert_eq!(store.get(d).unwrap(), delim, "Store should have the next delim: '{delim}'");
         assert!(store.contains(input), "Store should contain '{input}' (not split)");
 
@@ -709,11 +709,12 @@ mod tests {
         let parts1: Vec<u32> = store.store_path(path1);
 
         // 5 uniq parts + 1 delim + 1 empty string
-        let mut exp_len: usize = 7;
+        let mut exp_store_len: usize = 7;
+
         // 6 returned indices expected, not 5, since it includes the
         // empty string at the 1st index, as this is an absolute path
-        assert_eq!(parts1.len(), 6, "{parts1:?}");
-        assert_eq!(store.len(), exp_len);
+        assert_eq!(parts1.len(), exp_1.len(), "{parts1:?}");
+        assert_eq!(store.len(), exp_store_len);
 
         // Check that the delimiter is stored
         assert!(store.contains(PATH_SEP), "Store should contain the delim: '{PATH_SEP}'");
@@ -721,7 +722,7 @@ mod tests {
         // Check that the parts are stored correctly
         for (i, &idx) in parts1.iter().enumerate() {
             let exp: &str = exp_1[i];
-            assert_eq!(store.get(idx).unwrap(), exp, "parts1 {i} fail: '{exp}'",);
+            assert_eq!(store.get(idx).unwrap(), exp, "parts1 {i}: '{exp}'");
         }
 
         // Check that the original string can be reconstructed
@@ -745,17 +746,17 @@ mod tests {
         let exp_2: Vec<&str> = vec!["", "home", "user", "bar", "garbage2.txt"];
         let parts2: Vec<u32> = store.store_path(path2);
 
-        exp_len += 1; // 1 new part, as the "dots" should be normalized away
-        assert_eq!(parts2.len(), 5, "{parts2:?}");
-        assert_eq!(store.len(), exp_len);
+        exp_store_len += 1; // 1 new part, as the "dots" should be normalized away
+        assert_eq!(parts2.len(), exp_2.len(), "{parts2:?}");
+        assert_eq!(store.len(), exp_store_len);
 
         for (i, &idx) in parts2.iter().enumerate() {
             let exp: &str = exp_2[i];
-            assert_eq!(store.get(idx).unwrap(), exp, "parts2 {i} fail: '{exp}'",);
+            assert_eq!(store.get(idx).unwrap(), exp, "parts2 {i}: '{exp}'");
         }
 
         assert_eq!(
-            "/home/user/bar/garbage2.txt",
+            exp_2.iter().map(|s| *s).collect::<Vec<&str>>().join(PATH_SEP),
             store.reconstruct(&parts2, store.idx(PATH_SEP).unwrap()).unwrap(),
             "input <-> reconstruct() mismatch (path2)"
         );
@@ -767,17 +768,17 @@ mod tests {
         let exp_3: Vec<&str> = vec!["veri", "sekrit", "lokasjuun", "garbage.1"];
         let parts3: Vec<u32> = store.store_path(path3);
 
-        exp_len += 4;
-        assert_eq!(parts3.len(), 4, "{parts3:?}");
-        assert_eq!(store.len(), exp_len);
+        exp_store_len += 4;
+        assert_eq!(parts3.len(), exp_3.len(), "{parts3:?}");
+        assert_eq!(store.len(), exp_store_len);
 
         for (i, &idx) in parts3.iter().enumerate() {
             let exp: &str = exp_3[i];
-            assert_eq!(store.get(idx).unwrap(), exp, "parts3 {i} fail: '{exp}'",);
+            assert_eq!(store.get(idx).unwrap(), exp, "parts3 {i}: '{exp}'");
         }
 
         assert_eq!(
-            "veri/sekrit/lokasjuun/garbage.1",
+            exp_3.iter().map(|s| *s).collect::<Vec<&str>>().join(PATH_SEP),
             store.reconstruct(&parts3, store.idx(PATH_SEP).unwrap()).unwrap(),
             "input <-> reconstruct() mismatch (path3)"
         );
