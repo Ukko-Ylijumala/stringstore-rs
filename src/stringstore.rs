@@ -5,12 +5,14 @@
 use crate::hashing::{hash_bytes, CustomXxh3Hasher};
 use crate::utils::normalize_path;
 use parking_lot::RwLock;
+use regex::{escape, Regex};
 use size_of::{Context, SizeOf};
 use std::{
     cmp::Ordering,
     collections::HashMap,
     fmt::{self, Debug, Display, Formatter},
     hash::{BuildHasher, Hash, Hasher},
+    mem,
     ops::Deref,
     path::{Path, PathBuf},
     str::Split,
@@ -248,6 +250,74 @@ impl UniqueStrStore {
         };
 
         (self.store_parts(s, delim), delim_idx)
+    }
+
+    /**
+    Splits a given string into multiple parts based on multiple delimiters
+    and stores each part, returning their indices in the storage, along with
+    the storage indices of the provided delimiters.
+
+    First, the delimiters provided in `delims` are stored, then the string
+    `s` is split based on these delimiters. Each unique part obtained from
+    splitting is stored and its index returned. A simple tokenizer is used
+    for shorter strings, while a regex-based tokenizer handles longer strings
+    and/or larger sets of delimiters.
+
+    ## Arguments
+    * `s` - a string slice to be atomized
+    * `delims` - string slices, based on which `s` shall be split
+
+    ## Returns
+    A tuple of two [Vec]s:
+    - first one contains the indices of the parts of `s` (including delims!)
+    - second one contains the indices of the delimiters themselves
+
+    ## Special Cases
+    - If `s` is empty, index `0` is returned, along with the delimiter indices.
+    - If `delims` is empty, the function returns a Vec of the index of `s`
+      itself (assuming `s` is not empty), and an empty Vec for delimiters.
+
+    NOTE: the two tokenizers are based on different logic and might yield
+    differing results for the same input, especially if there is any overlap
+    between the provided delimiters. YMMV, buyer beware etc. (WIP)
+    */
+    pub fn split_and_store_multi(&self, s: &str, delims: &[&str]) -> (Vec<u32>, Vec<u32>) {
+        let complexity: usize = s.len() * delims.len(); // rough estimate
+        let mut result: Vec<u32> = vec![];
+        let mut delim_indices: Vec<u32> = vec![];
+
+        if !delims.is_empty() {
+            // store the delimiters first
+            for delim in delims {
+                if delim.is_empty() {
+                    delim_indices.push(0);
+                } else {
+                    delim_indices.push(self.insert(*delim));
+                }
+            }
+        }
+
+        if s.is_empty() {
+            // special case: empty string
+            return (vec![0], delim_indices);
+        } else if delims.is_empty() {
+            // special case: no delimiters
+            return (vec![self.insert(s)], vec![]);
+        }
+
+        // TODO: evaluate thresholds for switching between tokenizers
+        if complexity < 10000 || delims.len() <= 10 {
+            // use the simple tokenizer for shorter strings
+            for token in tokenize(s, delims).iter() {
+                result.push(self.insert(&token.content));
+            }
+        } else {
+            for token in tokenize_regex(s, delims).iter() {
+                result.push(self.insert(&token.content));
+            }
+        }
+
+        (result, delim_indices)
     }
 
     /**
@@ -564,6 +634,115 @@ impl<'a> From<StoredStr> for &'a str {
 
 /* ######################################################################### */
 
+#[derive(Default, Debug, PartialEq, Eq)]
+/// A token (part) of a delimited string, which has been processed (tokenized).
+/// It can be a delimiter, or a regular part.
+pub struct Token {
+    content: String,
+    is_delim: bool,           // default: false
+    delim_idx: Option<usize>, // default: None
+}
+
+/**
+Tokenize a string by a set of delimiters and return a [Vec] of [Token]s.
+The delimiters are included as separate tokens.
+
+This version uses a simple string search for delimiters.
+*/
+pub fn tokenize(s: &str, delims: &[&str]) -> Vec<Token> {
+    let mut tokens: Vec<Token> = Vec::new();
+    let mut current_token: String = String::new();
+    let mut i: usize = 0;
+
+    while i < s.len() {
+        if let Some((d_idx, delimiter)) = delims
+            .iter()
+            .enumerate()
+            .find(|(_, &d)| s[i..].starts_with(d))
+        {
+            if !current_token.is_empty() {
+                tokens.push(Token {
+                    content: mem::take(&mut current_token),
+                    ..Default::default()
+                });
+            }
+
+            tokens.push(Token {
+                content: delimiter.to_string(),
+                is_delim: true,
+                delim_idx: Some(d_idx),
+            });
+
+            i += delimiter.len();
+        } else {
+            current_token.push(s[i..].chars().next().unwrap());
+            i += 1;
+        }
+    }
+
+    if !current_token.is_empty() {
+        tokens.push(Token {
+            content: current_token,
+            ..Default::default()
+        });
+    }
+
+    tokens
+}
+
+/**
+Tokenize a string by a set of delimiters and return a [Vec] of [Token]s.
+The delimiters are included as separate tokens.
+
+In contrast to `tokenize()`, this version compiles a regex to find the
+delimiters, which should be faster for larger strings and more delimiters.
+*/
+pub fn tokenize_regex(s: &str, delims: &[&str]) -> Vec<Token> {
+    let pattern: String = delims
+        .iter()
+        .map(|p: &&str| escape(*p))
+        .collect::<Vec<_>>()
+        .join("|");
+    let re: Regex = Regex::new(&pattern).unwrap();
+    let mut tokens: Vec<Token> = Vec::new();
+    let mut last_end: usize = 0;
+
+    for found in re.find_iter(s) {
+        let start: usize = found.start();
+        let end: usize = found.end();
+
+        // Add non-delimiter token if there's text before this delimiter
+        if start > last_end {
+            tokens.push(Token {
+                content: s[last_end..start].to_string(),
+                ..Default::default()
+            });
+        }
+
+        // Add delimiter token
+        let delimiter = found.as_str();
+        tokens.push(Token {
+            content: delimiter.to_string(),
+            is_delim: true,
+            delim_idx: Some(delims.iter().position(|&d| d == delimiter).unwrap()),
+        });
+
+        last_end = end;
+    }
+
+    // Add final non-delimiter token if there's remaining text
+    if last_end < s.len() {
+        tokens.push(Token {
+            content: s[last_end..].to_string(),
+            ..Default::default()
+        });
+    }
+
+    tokens
+}
+
+/* ######################################################################### */
+
 mod tests {
     #[allow(unused_imports)]
     use super::*;
@@ -571,6 +750,97 @@ mod tests {
     const HELLO: &str = "Hello, world!";
     const CONC_S_NUM: usize = 100_000;
     const CONC_T_NUM: usize = 10;
+    const TOKEN_TEST: &str = "apple,banana,cherry,cake,,cake";
+    const TOKEN_DELIMS: [&str; 8] = [",", "cherry", " ", ",", ".", "!", "?", "\n"];
+    const TOKENS_LEN: usize = 10;
+    const TOKENS_EXPECTED: [&str; TOKENS_LEN] = [
+        "apple", ",", "banana", ",", "cherry", ",", "cake", ",", ",", "cake",
+    ];
+
+    #[rustfmt::skip]
+    #[test]
+    fn test_tokenize() {
+        let tokens: Vec<Token> = tokenize(TOKEN_TEST, &TOKEN_DELIMS);
+
+        // Check that the length and tokenization is correct
+        assert_eq!(tokens.len(), TOKENS_LEN, "len failed, tokens:\n{tokens:#?}");
+        for (i, &ref token) in tokens.iter().enumerate() {
+            let exp: &str = TOKENS_EXPECTED[i];
+            assert_eq!(token.content, exp, "token {i}: {token:?} (tokens: {tokens:#?})");
+        }
+    }
+
+    #[rustfmt::skip]
+    #[test]
+    fn test_tokenize_regex() {
+        let tokens: Vec<Token> = tokenize_regex(TOKEN_TEST, &TOKEN_DELIMS);
+
+        assert_eq!(tokens.len(), TOKENS_LEN, "len failed, tokens:\n{tokens:#?}");
+        for (i, &ref token) in tokens.iter().enumerate() {
+            let exp: &str = TOKENS_EXPECTED[i];
+            assert_eq!(token.content, exp, "token {i}: {token:?}, tokens:\n{tokens:#?})");
+        }
+
+        // detailed check for the tokenization
+        let t: [Token; 10] = [
+            Token { content: "apple".to_string(),  is_delim: false, delim_idx: None },
+            Token { content: ",".to_string(),      is_delim: true,  delim_idx: Some(0) },
+            Token { content: "banana".to_string(), is_delim: false, delim_idx: None },
+            Token { content: ",".to_string(),      is_delim: true,  delim_idx: Some(0) },
+            Token { content: "cherry".to_string(), is_delim: true,  delim_idx: Some(1) },
+            Token { content: ",".to_string(),      is_delim: true,  delim_idx: Some(0) },
+            Token { content: "cake".to_string(),   is_delim: false, delim_idx: None },
+            Token { content: ",".to_string(),      is_delim: true,  delim_idx: Some(0) },
+            Token { content: ",".to_string(),      is_delim: true,  delim_idx: Some(0) },
+            Token { content: "cake".to_string(),   is_delim: false, delim_idx: None }
+            ];
+
+        assert!(tokens == t, "tokens don't match expected:\n{tokens:#?}");
+    }
+
+    #[rustfmt::skip]
+    #[test]
+    fn test_tokenize_long() {
+        let test: &str = "Mary had a little lamb, its fleece was white as snow.\n";
+        let tokens: Vec<Token> = tokenize(test, &TOKEN_DELIMS);
+
+        assert_eq!(tokens.len(), 24, "len failed, tokens:\n{tokens:#?}");
+
+        let t: [Token; 24] = [
+            Token { content: "Mary".to_string(),   is_delim: false, delim_idx: None },
+            Token { content: " ".to_string(),      is_delim: true,  delim_idx: Some(2) },
+            Token { content: "had".to_string(),    is_delim: false, delim_idx: None },
+            Token { content: " ".to_string(),      is_delim: true,  delim_idx: Some(2) },
+            Token { content: "a".to_string(),      is_delim: false, delim_idx: None },
+            Token { content: " ".to_string(),      is_delim: true,  delim_idx: Some(2) },
+            Token { content: "little".to_string(), is_delim: false, delim_idx: None },
+            Token { content: " ".to_string(),      is_delim: true,  delim_idx: Some(2) },
+            Token { content: "lamb".to_string(),   is_delim: false, delim_idx: None },
+            Token { content: ",".to_string(),      is_delim: true,  delim_idx: Some(0) },
+            Token { content: " ".to_string(),      is_delim: true,  delim_idx: Some(2) },
+            Token { content: "its".to_string(),    is_delim: false, delim_idx: None },
+            Token { content: " ".to_string(),      is_delim: true,  delim_idx: Some(2) },
+            Token { content: "fleece".to_string(), is_delim: false, delim_idx: None },
+            Token { content: " ".to_string(),      is_delim: true,  delim_idx: Some(2) },
+            Token { content: "was".to_string(),    is_delim: false, delim_idx: None },
+            Token { content: " ".to_string(),      is_delim: true,  delim_idx: Some(2) },
+            Token { content: "white".to_string(),  is_delim: false, delim_idx: None },
+            Token { content: " ".to_string(),      is_delim: true,  delim_idx: Some(2) },
+            Token { content: "as".to_string(),     is_delim: false, delim_idx: None },
+            Token { content: " ".to_string(),      is_delim: true,  delim_idx: Some(2) },
+            Token { content: "snow".to_string(),   is_delim: false, delim_idx: None },
+            Token { content: ".".to_string(),      is_delim: true,  delim_idx: Some(4) },
+            Token { content: "\n".to_string(),     is_delim: true,  delim_idx: Some(7) },
+            ];
+
+            assert!(tokens == t, "tokens don't match expected:\n{tokens:#?}");
+
+            // regex part
+            let tokens: Vec<Token> = tokenize_regex(test, &TOKEN_DELIMS);
+            assert_eq!(tokens.len(), 24, "regex len failed, tokens:\n{tokens:#?}");
+            assert!(tokens == t, "regex tokens don't match expected:\n{tokens:#?}");
+
+    }
 
     #[test]
     fn test_unique_store_basic() {
