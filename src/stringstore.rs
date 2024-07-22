@@ -16,11 +16,15 @@ use std::{
     ops::Deref,
     path::{Path, PathBuf},
     str::Split,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU32, Ordering::Relaxed},
+        Arc,
+    },
 };
 
 const EMPTY_STR: &str = "";
 const PATH_SEP: &str = "/";
+const LATIN1_NUM: u32 = 256;
 
 /**
 A memory-efficient storage for unique string slices with stable indexing.
@@ -34,6 +38,8 @@ in scenarios where many duplicate strings are used.
 - Fast lookups: O(1) average complexity for both index and content-based lookups.
 - Stable indexing: once a string is stored, its index remains constant.
 - Allocations: uses [Box<str>] for heap allocation of strings.
+- the empty string ("") always occupies the first index (0).
+- ISO-8859-1 codepoints: contained implicitly, occupying indices 0-255.
 
 ## Design Considerations
 - Uses a [Vec<Box<str>>] for string storage, which is efficient for random access,
@@ -43,7 +49,9 @@ in scenarios where many duplicate strings are used.
 - Thread-safe due to wrapping storage/index fields with [RwLock]s.
 - trait [SharedStrStore]: is used to lock certain methods behind a shared reference.
 - trait [SizeOf]: provides a way to measure the size of the structure in memory.
-- the empty string ("") always occupies the first index (0).
+- ISO-8859-1: separate non-locking [Vec] for indices 0-255 to avoid locking
+  and hashing overhead for common characters.
+- First inserted string is always at index 256.
 
 ## Performance Characteristics
 - Insertion: O(1) average
@@ -73,22 +81,34 @@ use statter::stringstore::UniqueStrStore;
 
 let hello: &'static str = "Hello, world!";
 let store = UniqueStrStore::new();
+assert_eq!(store.len(), 256); // incl. ISO-8859-1 codepoints
 
-store.insert(hello);
-assert_eq!(store.len(), 2);
+let hello_id = store.insert(hello);
+assert_eq!(store.len(), 256 + 1);
 assert!(store.contains(hello));
+assert_eq!(hello_id, 256, "hello string stored at index 256");
 
-store.insert(hello);
-store.insert("foo");
-assert_eq!(store.len(), 3);
-assert_eq!(store.get(1).unwrap(), hello);
-// unsafe if the index is out of bounds
-assert_eq!(unsafe { store.get_unchecked(2) }, "foo");
+// try to insert the same string again
+let hello_id2 = store.insert(hello);
+assert_eq!(hello_id, hello_id2);
+assert_eq!(store.get(hello_id).unwrap(), hello);
+
+let foo_id = store.insert("foo");
+assert_eq!(store.len(), 256 + 2);
+assert_eq!(foo_id, 257, "foo string stored at index 257");
+
+// panics if the index is out of bounds
+assert_eq!(unsafe { store.get_raw(foo_id) }, "foo");
+
+// check internal consistency
+store.validate_contents().expect("Store validation failed");
 */
 #[derive(Default, Debug)]
 pub struct UniqueStrStore {
     store: RwLock<Vec<Box<str>>>,
     index: RwLock<HashMap<u64, u32, CustomXxh3Hasher>>,
+    ascii: Arc<Vec<Box<str>>>,
+    len: AtomicU32,
 }
 
 impl UniqueStrStore {
@@ -98,17 +118,28 @@ impl UniqueStrStore {
     }
 
     pub fn new_with_capacity(capacity: usize) -> Self {
-        let mut store: Vec<Box<str>> = Vec::with_capacity(capacity);
-        let mut index =
+        let index =
             HashMap::with_capacity_and_hasher(capacity, CustomXxh3Hasher::default().build_hasher());
 
-        // The first index is always the empty string.
-        store.push(EMPTY_STR.into());
-        index.insert(hash_bytes(EMPTY_STR.as_bytes()), 0);
+        // Make the ISO-8859-1 codepoint Vec. Its first element
+        // is always the empty string.
+        let mut latin1: Vec<Box<str>> = (0..LATIN1_NUM)
+            .into_iter()
+            .map(|i: u32| {
+                // this is safe because we stay in a safe range
+                unsafe { char::from_u32_unchecked(i as u32) }
+                    .to_string()
+                    .into()
+            })
+            .collect();
+        // replace the null string ('\0') with an empty string
+        latin1[0] = EMPTY_STR.into();
 
         UniqueStrStore {
-            store: store.into(),
+            store: Vec::with_capacity(capacity).into(),
             index: index.into(),
+            ascii: latin1.into(),
+            len: AtomicU32::new(LATIN1_NUM),
         }
     }
 
@@ -117,42 +148,64 @@ impl UniqueStrStore {
         self.into()
     }
 
-    /// The number of unique string slices stored.
+    /// The number of unique string slices. Includes the ISO-8859-1 codepoints.
     #[inline]
     pub fn len(&self) -> usize {
-        self.store.read().len()
+        self.len.load(Relaxed) as usize
     }
 
     /// Whether we already have this string slice stored.
     #[inline]
     pub fn contains(&self, s: &str) -> bool {
+        if s.len() == 0 {
+            return true; // empty string is always contained
+        }
+
+        if s.len() == 1 {
+            let c: u32 = s.chars().next().unwrap() as u32;
+            if c < LATIN1_NUM {
+                return true; // ISO-8859-1 implicitly contained
+            }
+        }
+
         self.index.read().contains_key(&hash_bytes(s.as_bytes()))
     }
 
     /// Get the index of a stored string slice by its content, if it exists.
     pub fn idx(&self, s: &str) -> Option<u32> {
-        self.index.read().get(&hash_bytes(s.as_bytes())).copied()
+        if s.len() == 0 {
+            return Some(0);
+        }
+
+        if s.len() == 1 {
+            let c: u32 = s.chars().next().unwrap() as u32;
+            if c < LATIN1_NUM {
+                return Some(c);
+            }
+        }
+
+        self.index
+            .read()
+            .get(&hash_bytes(s.as_bytes()))
+            .map(|i: &u32| i + LATIN1_NUM)
     }
 
     /// Get a reference to a stored string slice by its index, if it exists.
-    pub fn get<'a>(&'a self, idx: u32) -> Option<&'a str> {
-        let store = self.store.read();
-        if idx as usize >= store.len() {
-            None
-        } else {
-            drop(store); // must release the lock to avoid a deadlock
-            unsafe { Some(self.get_unchecked(idx)) }
+    pub fn get<'a>(&'a self, idx: u32) -> Result<&'a str, String> {
+        let len: usize = self.len();
+        if idx as usize >= len {
+            return Err("Index {idx} out of bounds (max: {len})".to_string());
         }
+        unsafe { Ok(self.get_raw(idx)) }
     }
 
     /**
-    Returns a reference to a stored [str] without doing bounds checking.
+    Returns a raw reference to a stored [str]. For a safe alternative, use `get`.
 
-    For a safe alternative, use `get`.
     ### Safety
-    Calling this method with an out-of-bounds index is undefined behavior
-    even if the resulting reference is not used.
+    Calling this method with an out-of-bounds index will panic.
 
+    ### Details
     Since we're going through a [RwLock], we need to do some extra pointer
     magic, as returning a [Box::as_ref()] directly would make the borrow
     checker complain about "cannot return value referencing local variable".
@@ -165,8 +218,18 @@ impl UniqueStrStore {
     std::str::from_utf8_unchecked(bytes)
     */
     #[inline]
-    pub unsafe fn get_unchecked<'a>(&'a self, idx: u32) -> &'a str {
+    pub unsafe fn get_raw<'a>(&'a self, idx: u32) -> &'a str {
+        // ISO-8859-1 range
+        if idx < LATIN1_NUM {
+            return &*self.ascii[idx as usize];
+        }
+
+        let idx: u32 = idx - LATIN1_NUM;
         let store = self.store.read();
+        if idx as usize >= store.len() {
+            panic!("Store index {idx} out of bounds (max: {})", store.len());
+        }
+
         let b: &Box<str> = store.get_unchecked(idx as usize);
         let ptr: *const str = b.as_ref() as *const str;
         &*ptr
@@ -185,13 +248,14 @@ impl UniqueStrStore {
 
         // Check again to be safe.
         if index.contains_key(&key) {
-            return index.get(&key).copied().unwrap();
+            return index.get(&key).map(|i: &u32| i + LATIN1_NUM).unwrap();
         }
 
         let idx: u32 = store.len() as u32;
         index.insert(key, idx);
         store.push(s.into());
-        idx
+        self.len.fetch_add(1, Relaxed);
+        idx + LATIN1_NUM
     }
 
     /// Insert a new string (slice), if it doesn't already exist.
@@ -204,6 +268,15 @@ impl UniqueStrStore {
         if s.is_empty() {
             return 0;
         }
+
+        if s.len() == 1 {
+            let c: u32 = s.chars().next().unwrap() as u32;
+            if c < LATIN1_NUM {
+                return c; // ISO-8859-1 code point
+            }
+        }
+
+        // For non-ASCII or multi-character strings
         if let Some(idx) = self.idx(&s) {
             idx
         } else {
@@ -341,7 +414,6 @@ impl UniqueStrStore {
     where
         P: AsRef<Path>,
     {
-        self.insert(PATH_SEP);
         let s: PathBuf = normalize_path(s);
         if s.as_os_str().is_empty() {
             return [0].into();
@@ -367,27 +439,38 @@ impl UniqueStrStore {
         // special case: empty string
         if parts_num == 0 || (parts_num == 1 && indices[0] == 0) {
             return Ok(EMPTY_STR.to_string());
-        } else if parts_num >= u32::MAX as usize {
-            return Err("Size is larger than u32::MAX - 1".to_string());
+        } else if parts_num > u32::MAX as usize {
+            return Err("Size is larger than u32::MAX".to_string());
         }
 
         // delimiter check
+        // we lock the store at this point so that the length is stable
         let store = self.store.read();
-        let stored_num: u32 = store.len() as u32;
+        let stored_num: u32 = self.len() as u32;
         if delim >= stored_num {
             return Err("Delimiter index {idx} out of bounds".to_string());
         }
 
+        // get the delimiter string
+        let delim_str: &Box<str> = match delim < LATIN1_NUM {
+            true => &self.ascii[delim as usize],
+            false => &store[(delim - LATIN1_NUM) as usize],
+        };
+
         // construct the string
-        let delim_str: &Box<str> = &store[delim as usize];
         let mut result: String = String::new();
         for (i, idx) in indices.iter().enumerate() {
             if idx >= &stored_num {
                 return Err("String index {idx} (pos: {i}) out of bounds".to_string());
             }
+
             if idx != &0 {
-                result.push_str(&store[*idx as usize]);
+                result.push_str(match idx < &LATIN1_NUM {
+                    true => &self.ascii[*idx as usize],
+                    false => &store[(*idx - LATIN1_NUM) as usize],
+                });
             }
+
             if i < parts_num - 1 {
                 // no delimiter after the last part
                 result.push_str(delim_str);
@@ -410,10 +493,14 @@ impl UniqueStrStore {
         // we want exclusive locks for validation to ensure consistency
         let store = self.store.write();
         let index = self.index.write();
+        let len: usize = self.len();
         let mut errs: Vec<String> = Vec::new();
 
         let l_store: usize = store.len();
         let l_index: usize = index.len();
+        if l_store + LATIN1_NUM as usize != len {
+            errs.push(format!("store.len() ({l_store}) != stored length ({len})"));
+        };
         if l_store != l_index {
             errs.push(format!("store.len() ({l_store}) != index.len() ({l_index})"));
         };
@@ -480,11 +567,7 @@ impl SharedStrStore for Arc<UniqueStrStore> {
     /// The reference of a stored string slice, if it exists.
     #[inline]
     fn get_ref(&self, s: &str) -> Option<StoredStr> {
-        self.index
-            .read()
-            .get(&hash_bytes(s.as_bytes()))
-            .copied()
-            .map(|idx: u32| StoredStr(idx, self.clone()))
+        self.idx(s).map(|idx: u32| StoredStr(idx, self.clone()))
     }
 
     /// Insert a new string (slice) and return its [StoredStr] reference.
@@ -510,6 +593,7 @@ impl SizeOf for UniqueStrStore {
     fn size_of_children(&self, context: &mut Context) {
         self.store.read().size_of_children(context);
         self.index.read().size_of_children(context);
+        self.ascii.size_of_children(context);
     }
 }
 
@@ -523,7 +607,7 @@ impl StoredStr {
     #[inline]
     /// This method is safe to call, as our reference is guaranteed to be valid.
     fn reference(&self) -> &str {
-        unsafe { (*self.1).get_unchecked(self.0) }
+        unsafe { (*self.1).get_raw(self.0) }
     }
 
     /// Get the index of the stored string slice.
@@ -626,7 +710,7 @@ impl<'a> From<StoredStr> for u32 {
 impl<'a> From<StoredStr> for &'a str {
     fn from(v: StoredStr) -> &'a str {
         unsafe {
-            let ptr: *const str = (*v.1).get_unchecked(v.0) as *const str;
+            let ptr: *const str = (*v.1).get_raw(v.0) as *const str;
             &*ptr
         }
     }
@@ -845,17 +929,20 @@ mod tests {
     #[test]
     fn test_unique_store_basic() {
         let store: UniqueStrStore = UniqueStrStore::new_with_capacity(10);
+        assert_eq!(store.len(), LATIN1_NUM as usize, "Store length should be {LATIN1_NUM}");
+
+        let test = ["", " ", "a", "Z", "1", "2", "3", "/", ",", ")"];
+        for s in test {
+            assert!(store.contains(s), "store should contains('{s}')");
+        }
+
         let i: u32 = store.insert(HELLO);
-        let num: usize = i as usize + 1;
+        let num: usize = LATIN1_NUM as usize + 1;
 
         assert_eq!(store.len(), num, "Store length should be {num}");
         assert!(store.contains(HELLO), "Store does not contain '{HELLO}': {store:?}");
         assert_eq!(store.get(i).unwrap(), HELLO, "get({i}) should == '{HELLO}'");
-        assert_eq!(
-            unsafe { store.get_unchecked(i) },
-            HELLO,
-            "get_unchecked({i}) should == '{HELLO}'"
-        );
+        assert_eq!(unsafe { store.get_raw(i) }, HELLO, "get_unchecked({i}) should == '{HELLO}'");
     }
 
     #[test]
@@ -863,7 +950,7 @@ mod tests {
         let foo_s: &'static str = "foo";
         let store: Arc<UniqueStrStore> = UniqueStrStore::new_with_capacity(10).shared();
         let stored: StoredStr = store.insert_or_get(HELLO);
-        let start: u32 = 1;
+        let start: u32 = LATIN1_NUM;
 
         assert_eq!(store.len(), start as usize + 1, "Store length should be {}", start + 1);
         assert!(store.contains(HELLO), "Store does not contain '{HELLO}': {store:?}");
@@ -880,7 +967,7 @@ mod tests {
         assert_eq!(stored, again, "StoredStr instances should be equal: {stored:?} != {again:?}");
         assert_eq!(store.get(start).unwrap(), HELLO, "get({start}) should == '{HELLO}'");
         assert_eq!(
-            unsafe { store.get_unchecked(start + 1) },
+            unsafe { store.get_raw(start + 1) },
             foo_s,
             "get_unchecked({}) should == '{foo_s}'",
             start + 1
@@ -891,7 +978,9 @@ mod tests {
     fn test_concurrent_inserts() {
         use std::thread;
 
-        let store: Arc<UniqueStrStore> = UniqueStrStore::new_with_capacity(CONC_S_NUM).shared();
+        let exp_len: usize = CONC_S_NUM + LATIN1_NUM as usize;
+        let store: Arc<UniqueStrStore> = UniqueStrStore::new_with_capacity(exp_len).shared();
+
         let threads: Vec<_> = (0..CONC_T_NUM)
             .map(|t: usize| {
                 let store = store.clone();
@@ -910,7 +999,36 @@ mod tests {
         }
 
         store.validate_contents().ok(); // will panic on failure in debug mode
-        assert_eq!(store.len(), CONC_S_NUM + 1, "Stored num should be {}", CONC_S_NUM + 1);
+        assert_eq!(store.len(), exp_len, "Stored num should be {}", exp_len);
+    }
+
+    #[test]
+    fn test_competing_inserts() {
+        use std::thread;
+
+        let per_thread: usize = CONC_S_NUM / CONC_T_NUM;
+        let exp_len: usize = per_thread + LATIN1_NUM as usize;
+        let store: Arc<UniqueStrStore> = UniqueStrStore::new_with_capacity(exp_len).shared();
+
+        let threads: Vec<_> = (0..CONC_T_NUM)
+            .map(|_t| {
+                let store = store.clone();
+                thread::spawn(move || {
+                    (0..per_thread).for_each(|i: usize| {
+                        let s: String = format!("{HELLO} i: {i}");
+                        let stored: StoredStr = store.insert_or_get(&s);
+                        assert_eq!(stored.as_ref(), s, "Stored string should be '{s}': {stored:?}");
+                    })
+                })
+            })
+            .collect();
+
+        for t in threads {
+            t.join().unwrap();
+        }
+
+        store.validate_contents().ok(); // will panic on failure in debug mode
+        assert_eq!(store.len(), exp_len, "Stored num should be {}", exp_len);
     }
 
     #[rustfmt::skip]
@@ -920,7 +1038,8 @@ mod tests {
         let input: &str = ",apple,banana,cherry,cake,,cake,,,";
         let exp_v: Vec<&str> = vec!["", "apple", "banana", "cherry", "cake", "", "cake", "", "", ""];
         let delim: &str = ",";
-        let mut exp_store_len: usize = 6; // 4 uniq parts + 1 delim + 1 empty string
+        // 4 uniq parts (delim + empty string already should exist)
+        let mut exp_store_len: usize = (LATIN1_NUM + 4) as usize;
 
         let (indices, d) = store.split_and_store(input, delim);
         assert_eq!(indices.len(), exp_v.len(), "{indices:?}");
@@ -939,7 +1058,7 @@ mod tests {
         // Check that the original string can be reconstructed
         let built: String = indices
             .iter()
-            .map(|&idx| unsafe { store.get_unchecked(idx) })
+            .map(|&idx| unsafe { store.get_raw(idx) })
             .collect::<Vec<&str>>()
             .join(delim);
 
@@ -955,7 +1074,7 @@ mod tests {
         // Check for incorrect delimiter handling
         let delim: &str = ";";
         let (indices, d) = store.split_and_store(input, delim);
-        exp_store_len += 2; // 1 new delim + 1 new part
+        exp_store_len += 1; // +1 new part
         assert_eq!(indices.len(), 1, "{indices:?}");
         assert_eq!(store.len(), exp_store_len);
         assert_eq!(store.get(d).unwrap(), delim, "Store should have the next delim: '{delim}'");
@@ -978,8 +1097,8 @@ mod tests {
         let exp_1: Vec<&str> = vec!["", "home", "user", "foo", "bar", "garbage.txt"];
         let parts1: Vec<u32> = store.store_path(path1);
 
-        // 5 uniq parts + 1 delim + 1 empty string
-        let mut exp_store_len: usize = 7;
+        // 5 uniq parts (delim + empty string already should exist)
+        let mut exp_store_len: usize = (LATIN1_NUM + 5) as usize;
 
         // 6 returned indices expected, not 5, since it includes the
         // empty string at the 1st index, as this is an absolute path
@@ -998,7 +1117,7 @@ mod tests {
         // Check that the original string can be reconstructed
         let built: String = parts1
             .iter()
-            .map(|&idx| unsafe { store.get_unchecked(idx) })
+            .map(|&idx| unsafe { store.get_raw(idx) })
             .collect::<Vec<&str>>()
             .join(PATH_SEP);
 
@@ -1038,7 +1157,7 @@ mod tests {
         let exp_3: Vec<&str> = vec!["veri", "sekrit", "lokasjuun", "garbage.1"];
         let parts3: Vec<u32> = store.store_path(path3);
 
-        exp_store_len += 4;
+        exp_store_len += exp_3.len();
         assert_eq!(parts3.len(), exp_3.len(), "{parts3:?}");
         assert_eq!(store.len(), exp_store_len);
 
