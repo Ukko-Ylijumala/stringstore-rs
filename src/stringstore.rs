@@ -3,6 +3,7 @@
 #![allow(dead_code)]
 
 use crate::hashing::{hash_bytes, CustomXxh3Hasher};
+use crate::timesince::SecondsSinceEpoch;
 use crate::utils::normalize_path;
 use parking_lot::RwLock;
 use regex::{escape, Regex};
@@ -13,14 +14,16 @@ use std::{
     fmt::{self, Debug, Display, Formatter},
     hash::{BuildHasher, Hash, Hasher},
     mem,
+    net::IpAddr, //Ipv4Addr, Ipv6Addr},
     ops::Deref,
     path::{Path, PathBuf},
-    str::Split,
+    str::{FromStr, Split},
     sync::{
         atomic::{AtomicU32, Ordering::Relaxed},
         Arc,
     },
 };
+//use uuid::Uuid;
 
 const EMPTY_STR: &str = "";
 const PATH_SEP: &str = "/";
@@ -599,7 +602,12 @@ impl SizeOf for UniqueStrStore {
 
 /* ######################################################################### */
 
-/// A reference (index) to a stored string slice in a [UniqueStrStore].
+/**
+A reference (index) to a stored string slice in a [UniqueStrStore].
+
+This is a self-contained version which has a reference back to the store,
+which allows it to be used in place of a "normal" string slice.
+*/
 #[derive(Clone)]
 pub struct StoredStr(u32, Arc<UniqueStrStore>);
 
@@ -715,6 +723,258 @@ impl<'a> From<StoredStr> for &'a str {
         }
     }
 }
+
+/* ######################################################################### */
+
+/**
+A reference (index) to a stored string slice in a [UniqueStrStore].
+
+This is a compact version which lacks a reference back to the containing store,
+hence it is only usable as a part of a larger structure with a reference.
+*/
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CompactStr(u32);
+
+impl CompactStr {
+    #[inline]
+    fn idx(&self) -> u32 {
+        self.0
+    }
+
+    fn get<'a>(&self, store: &'a UniqueStrStore) -> &'a str {
+        unsafe { store.get_raw(self.0) }
+    }
+
+    fn to_string(&self, store: &UniqueStrStore) -> String {
+        self.get(store).to_string()
+    }
+}
+
+/// This is a single or repeated character stored in a [UniqueStrStore].
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Character(CompactStr, u8);
+
+impl Character {
+    #[inline]
+    fn idx(&self) -> u32 {
+        self.0 .0
+    }
+
+    #[inline]
+    fn num(&self) -> u8 {
+        self.1
+    }
+
+    fn get<'a>(&self, store: &'a UniqueStrStore) -> &'a str {
+        unsafe { store.get_raw(self.idx()) }
+    }
+
+    fn to_string(&self, store: &UniqueStrStore) -> String {
+        self.get(store).repeat(self.num() as usize)
+    }
+}
+
+/* --------------------------------- */
+
+/// Possible text elements in a structured line.
+#[derive(Debug, PartialEq)]
+enum TextElement<I: Integer = i64> {
+    /// An element which is explicitly a delimiter, f.ex. space (`" "`).
+    Delimiter(Character),
+    /// A single (or repeated) character, f.ex. `*` or `***`.
+    Char(Character),
+    Word(CompactStr),
+    /// A key-value pair, f.ex. `foo="bar"`.
+    KeyVal(CompactStr, CompactStr),
+    /// Integer type. Define like this (i64 is default):
+    /// ```ignore
+    /// let elem = TextElement::<i32>::Integer(42);
+    Integer(I),
+    Float(f64),
+    /// A range of integers with "range" marker, f.ex. `-15..10` or `0-100`.
+    Range(I, I, Character),
+    /// A date in the format `YYYY-MM-DD`.
+    Day(i16, u8, u8),
+    /// A time in the format `HH:MM:SS`.
+    Time(u8, u8, u8),
+    /// A timestamp as seconds since the Unix epoch.
+    Timestamp(SecondsSinceEpoch),
+    /// An IPv4 or IPv6 address.
+    IPAddress(IpAddr),
+    /// A host name, f.ex. `www.example.org`. Usually a FQDN.
+    Hostname(CompactStr),
+    /// An username, f.ex. `john@workstation`.
+    Username(CompactStr, CompactStr),
+    /// An email address, f.ex. `john.doe@example.org`.
+    Email(CompactStr, CompactStr),
+    /// A hexadecimal number, f.ex. `0xdeadbeef` or `feedf00d`.
+    HexStr(Hex, HexFormat),
+    /// A sentence as a single element, f.ex. `Mary had a little lamb.`.
+    Sentence(Vec<CompactStr>),
+    /// A URL, f.ex. `https://www.example.org:8080/path/to/file.html`.
+    URLStr(Vec<CompactStr>),
+    /// URL query params, f.ex. `?foo=bar&baz=qux`. Question mark is implicit.
+    URLParams(Vec<CompactStr>),
+    /// Enclosed [TextElement] with a start and end delimiter.
+    EnclosedElem(Box<TextElement>, CompactStr, CompactStr),
+    /// Unprocessed text.
+    RawText(String),
+    // Maybe for future...?
+    //UuidStr(Uuid),
+    //PhoneNumber,
+    //GeoCoordinate,
+    //Duration,
+}
+
+/* --------------------------------- */
+
+/// A unit of structured text, which can be a line or a block.
+/// Contains a reference to the [UniqueStrStore] for string retrieval.
+#[derive(Debug)]
+struct StructuredLine {
+    elems: Vec<TextElement>,
+    store: Arc<UniqueStrStore>,
+}
+
+impl StructuredLine {
+    fn new(store: &Arc<UniqueStrStore>) -> Self {
+        Self {
+            elems: Vec::new(),
+            store: store.clone(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.elems.len()
+    }
+
+    fn push(&mut self, elem: TextElement) {
+        self.elems.push(elem);
+    }
+}
+
+impl PartialEq for StructuredLine {
+    fn eq(&self, other: &Self) -> bool {
+        self.elems == other.elems
+    }
+}
+
+/* --------------------------------- */
+
+/// A representation of a hexadecimal number.
+#[derive(Clone, Copy, PartialEq)]
+struct Hex(u64);
+
+impl Hex {
+    fn get(&self) -> u64 {
+        self.0
+    }
+
+    fn to_string(&self, fmt: HexFormat) -> String {
+        let mut result: String = format!("{:x}", self.0);
+        if fmt.is_prefix() {
+            result = format!("0x{}", result);
+        }
+        if fmt.is_upper() {
+            result = result.to_uppercase();
+        }
+        if fmt.is_columns() {
+            result = result
+                .chars()
+                .enumerate()
+                .map(|(i, c)| {
+                    if i % 4 == 0 && i != 0 {
+                        format!(":{}{}", c, i)
+                    } else {
+                        c.to_string()
+                    }
+                })
+                .collect();
+        }
+        result
+    }
+}
+
+impl Debug for Hex {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "Hex({:x})", self.0)
+    }
+}
+
+impl Display for Hex {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "{:x}", self.0)
+    }
+}
+
+/* --------------------------------- */
+
+/// Bitmap of options for hex string display.
+#[derive(Clone, Copy, PartialEq)]
+pub struct HexFormat(u8);
+
+impl HexFormat {
+    pub const PLAIN: Self = Self(0b0);
+    pub const UPPER: Self = Self(0b1);
+    pub const PREFIX: Self = Self(0b10);
+    pub const COLUMNS: Self = Self(0b100);
+
+    /// Whether the hex string is uppercase.
+    pub fn is_upper(&self) -> bool {
+        self.0 & Self::UPPER.0 != 0
+    }
+    /// Whether the "0x" prefix should be shown.
+    pub fn is_prefix(&self) -> bool {
+        self.0 & Self::PREFIX.0 != 0
+    }
+    /// Whether the parts are divided by columns (":").
+    pub fn is_columns(&self) -> bool {
+        self.0 & Self::COLUMNS.0 != 0
+    }
+
+    #[rustfmt::skip]
+    pub fn to_string(&self) -> String {
+        if *self == Self::PLAIN {
+            return "Plain".to_string();
+        }
+
+        let mut parts: Vec<&str> = Vec::new();
+        if self.is_upper() { parts.push("Upper"); }
+        if self.is_prefix() { parts.push("Prefix"); }
+        if self.is_columns() { parts.push("Columns"); }
+        parts.join("|")
+    }
+}
+
+impl Debug for HexFormat {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "HexFmt({}: {})", self.0, self.to_string())
+    }
+}
+
+/* --------------------------------- */
+
+trait Integer: FromStr + Display + Debug + Copy + PartialOrd + Send + Sync + 'static {
+    fn as_i64(&self) -> i64;
+    fn as_u64(&self) -> u64;
+}
+
+macro_rules! impl_integer {
+    ($($t:ty),*) => {
+        $(
+            impl Integer for $t {
+                fn as_i64(&self) -> i64 {
+                    *self as i64
+                }
+                fn as_u64(&self) -> u64 {
+                    *self as u64
+                }
+            }
+        )*
+    }
+}
+
+impl_integer!(i8, i16, i32, i64, i128, isize, u8, u16, u32, u64, u128, usize);
 
 /* ######################################################################### */
 
