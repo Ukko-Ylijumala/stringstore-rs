@@ -5,12 +5,12 @@
 use crate::hashing::{hash_bytes, CustomXxh3Hasher};
 use crate::timesince::SecondsSinceEpoch;
 use crate::utils::normalize_path;
+use dashmap::DashMap;
 use parking_lot::RwLock;
 use regex::{escape, Regex};
 use size_of::{Context, SizeOf};
 use std::{
     cmp::Ordering,
-    collections::HashMap,
     fmt::{self, Debug, Display, Formatter},
     hash::{BuildHasher, Hash, Hasher},
     mem,
@@ -42,7 +42,7 @@ in scenarios where many duplicate strings are used.
 - Stable indexing: once a string is stored, its index remains constant.
 - Allocations: uses [Box<str>] for heap allocation of strings.
 - the empty string ("") always occupies the first index (0).
-- ISO-8859-1 codepoints: contained implicitly, occupying indices 0-255.
+- ISO-8859-1 codepoints: contained explicitly, at indices 1-255 (minus '\0').
 
 ## Design Considerations
 - Uses a [Vec<Box<str>>] for string storage, which is efficient for random access,
@@ -109,7 +109,7 @@ store.validate_contents().expect("Store validation failed");
 #[derive(Default, Debug)]
 pub struct UniqueStrStore {
     store: RwLock<Vec<Box<str>>>,
-    index: RwLock<HashMap<u64, u32, CustomXxh3Hasher>>,
+    index: DashMap<u64, u32, CustomXxh3Hasher>,
     ascii: Arc<Vec<Box<str>>>,
     len: AtomicU32,
 }
@@ -121,9 +121,6 @@ impl UniqueStrStore {
     }
 
     pub fn new_with_capacity(capacity: usize) -> Self {
-        let index =
-            HashMap::with_capacity_and_hasher(capacity, CustomXxh3Hasher::default().build_hasher());
-
         // Make the ISO-8859-1 codepoint Vec. Its first element
         // is always the empty string.
         let mut latin1: Vec<Box<str>> = (0..LATIN1_NUM)
@@ -140,7 +137,10 @@ impl UniqueStrStore {
 
         UniqueStrStore {
             store: Vec::with_capacity(capacity).into(),
-            index: index.into(),
+            index: DashMap::with_capacity_and_hasher(
+                capacity,
+                CustomXxh3Hasher::default().build_hasher(),
+            ),
             ascii: latin1.into(),
             len: AtomicU32::new(LATIN1_NUM),
         }
@@ -171,7 +171,7 @@ impl UniqueStrStore {
             }
         }
 
-        self.index.read().contains_key(&hash_bytes(s.as_bytes()))
+        self.index.contains_key(&hash_bytes(s.as_bytes()))
     }
 
     /// Get the index of a stored string slice by its content, if it exists.
@@ -188,9 +188,8 @@ impl UniqueStrStore {
         }
 
         self.index
-            .read()
             .get(&hash_bytes(s.as_bytes()))
-            .map(|i: &u32| i + LATIN1_NUM)
+            .map(|r| r.value() + LATIN1_NUM)
     }
 
     /// Get a reference to a stored string slice by its index, if it exists.
@@ -246,19 +245,18 @@ impl UniqueStrStore {
     */
     fn insert_unchecked(&self, s: String) -> u32 {
         let mut store = self.store.write();
-        let mut index = self.index.write();
         let key: u64 = hash_bytes(s.as_bytes());
-
-        // Check again to be safe.
-        if index.contains_key(&key) {
-            return index.get(&key).map(|i: &u32| i + LATIN1_NUM).unwrap();
-        }
-
+        // next free index
         let idx: u32 = store.len() as u32;
-        index.insert(key, idx);
-        store.push(s.into());
-        self.len.fetch_add(1, Relaxed);
-        idx + LATIN1_NUM
+
+        // atomic get or insert
+        let indexed: u32 = *self.index.entry(key).or_insert(idx);
+        if indexed == idx {
+            // we did in fact insert a new string
+            store.push(s.into());
+            self.len.fetch_add(1, Relaxed);
+        }
+        indexed + LATIN1_NUM
     }
 
     /// Insert a new string (slice), if it doesn't already exist.
@@ -495,12 +493,11 @@ impl UniqueStrStore {
     pub fn validate_contents(&self) -> Result<(), Vec<String>> {
         // we want exclusive locks for validation to ensure consistency
         let store = self.store.write();
-        let index = self.index.write();
         let len: usize = self.len();
         let mut errs: Vec<String> = Vec::new();
 
         let l_store: usize = store.len();
-        let l_index: usize = index.len();
+        let l_index: usize = self.index.len();
         if l_store + LATIN1_NUM as usize != len {
             errs.push(format!("store.len() ({l_store}) != stored length ({len})"));
         };
@@ -511,20 +508,22 @@ impl UniqueStrStore {
         // Check that each store entry has a corresponding index.
         for (sid, s) in store.iter().enumerate() {
             let key: u64 = hash_bytes(s.as_bytes());
-            if !index.contains_key(&key) {
+            if !self.index.contains_key(&key) {
                 errs.push(format!("missing hash: 0x{key:x} (str_id: {sid}, str: '{s}')"));
-            };
-            let found: u32 = index[&key];
-            if found != sid as u32 {
-                errs.push(format!(
-                    "index mismatch for str_id {sid} ('{s}'): hash 0x{key:x} -> {found} ('{}')",
-                    &*store[found as usize]
-                ));
+            } else {
+                let found: u32 = *self.index.get(&key).unwrap();
+                if found != sid as u32 {
+                    errs.push(format!(
+                        "index mismatch for str_id {sid} ('{s}'): hash 0x{key:x} -> {found} ('{}')",
+                        &*store[found as usize]
+                    ));
+                }
             }
         }
 
         // Check that each index is valid wrt. the store.
-        for (key, sid) in index.iter() {
+        for itm in self.index.iter() {
+            let (key, sid) = itm.pair();
             if (*sid as usize) >= l_store {
                 errs.push(format!("index out of bounds: {sid} >= {l_store} (hash: 0x{key:x})"));
             }
@@ -591,12 +590,29 @@ impl SharedStrStore for Arc<UniqueStrStore> {
     }
 }
 
-// We have to implement our own since `size_of::SizeOf` does not support `RwLock`.
+// We have to implement our own since `size_of::SizeOf` does not support
+// `RwLock` nor `DashMap`.
 impl SizeOf for UniqueStrStore {
     fn size_of_children(&self, context: &mut Context) {
         self.store.read().size_of_children(context);
-        self.index.read().size_of_children(context);
         self.ascii.size_of_children(context);
+
+        if self.index.capacity() > 0 {
+            // key + value + RwLock
+            let used: usize = (8 + 4 + 8) * self.index.len();
+            let total: usize = (8 + 4 + 8) * self.index.capacity();
+            context
+                .add(used)
+                .add_excess(total - used)
+                .add_distinct_allocation();
+
+            self.index.iter().for_each(|itm| {
+                itm.key().size_of_children(context);
+                itm.value().size_of_children(context);
+            });
+        };
+
+        self.index.hasher().size_of_children(context);
     }
 }
 
