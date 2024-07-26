@@ -5,6 +5,7 @@
 use crate::hashing::{hash_bytes, CustomXxh3Hasher};
 use crate::timesince::SecondsSinceEpoch;
 use crate::utils::normalize_path;
+use crossbeam::atomic::AtomicCell;
 use dashmap::DashMap;
 use parking_lot::RwLock;
 use regex::{escape, Regex};
@@ -18,10 +19,7 @@ use std::{
     ops::Deref,
     path::{Path, PathBuf},
     str::{FromStr, Split},
-    sync::{
-        atomic::{AtomicU32, Ordering::Relaxed},
-        Arc,
-    },
+    sync::Arc,
 };
 //use uuid::Uuid;
 
@@ -47,10 +45,9 @@ in scenarios where many duplicate strings are used.
 ## Design Considerations
 - Uses a [Vec<Box<str>>] for string storage, which is efficient for random access,
   and should help with cache locality as well.
-- Uses a [HashMap] with `u64` Xxh3 string hashes as keys for fast lookups.
+- Uses a [DashMap] with `u64` Xxh3 string hashes as keys for fast lookups.
 - Custom [xxhash_rust] hasher ([CustomXxh3Hasher]) for potentially faster hashing.
-- Thread-safe due to wrapping storage/index fields with [RwLock]s.
-- trait [SharedStrStore]: is used to lock certain methods behind a shared reference.
+- Thread-safe.
 - trait [SizeOf]: provides a way to measure the size of the structure in memory.
 - ISO-8859-1: separate non-locking [Vec] for indices 0-255 to avoid locking
   and hashing overhead for common characters.
@@ -75,8 +72,6 @@ non-bounds-checking lookup (meant mostly for internal use with known indices).
 - Does not support string modification after insertion.
 - No partial deduplication of strings (e.g. substrings).
 - The maximum number of unique strings is limited by the [u32] index.
-- Methods which return a [StoredStr] reference can only be used if the
-  [UniqueStrStore] is wrapped in an [Arc] (as it must point back to the store).
 
 ## Example
 ```
@@ -106,12 +101,12 @@ assert_eq!(unsafe { store.get_raw(foo_id) }, "foo");
 // check internal consistency
 store.validate_contents().expect("Store validation failed");
 */
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone)]
 pub struct UniqueStrStore {
-    store: RwLock<Vec<Box<str>>>,
-    index: DashMap<u64, u32, CustomXxh3Hasher>,
+    store: Arc<RwLock<Vec<Box<str>>>>,
+    index: Arc<DashMap<u64, u32, CustomXxh3Hasher>>,
     ascii: Arc<Vec<Box<str>>>,
-    len: AtomicU32,
+    len: Arc<AtomicCell<u32>>,
 }
 
 impl UniqueStrStore {
@@ -136,13 +131,13 @@ impl UniqueStrStore {
         latin1[0] = EMPTY_STR.into();
 
         UniqueStrStore {
-            store: Vec::with_capacity(capacity).into(),
+            store: RwLock::new(Vec::with_capacity(capacity)).into(),
             index: DashMap::with_capacity_and_hasher(
                 capacity,
                 CustomXxh3Hasher::default().build_hasher(),
-            ),
+            ).into(),
             ascii: latin1.into(),
-            len: AtomicU32::new(LATIN1_NUM),
+            len: AtomicCell::new(LATIN1_NUM).into(),
         }
     }
 
@@ -154,7 +149,7 @@ impl UniqueStrStore {
     /// The number of unique string slices. Includes the ISO-8859-1 codepoints.
     #[inline]
     pub fn len(&self) -> usize {
-        self.len.load(Relaxed) as usize
+        self.len.load() as usize
     }
 
     /// Whether we already have this string slice stored.
@@ -254,7 +249,7 @@ impl UniqueStrStore {
         if indexed == idx {
             // we did in fact insert a new string
             store.push(s.into());
-            self.len.fetch_add(1, Relaxed);
+            self.len.fetch_add(1);
         }
         indexed + LATIN1_NUM
     }
@@ -283,6 +278,29 @@ impl UniqueStrStore {
         } else {
             self.insert_unchecked(s)
         }
+    }
+
+    /// The reference of a stored string slice, if it exists.
+    #[inline]
+    fn get_ref(&self, s: &str) -> Option<StoredStr> {
+        self.idx(s).map(|idx: u32| StoredStr(idx, self))
+    }
+
+    /// Insert a new string (slice) and return its [StoredStr] reference.
+    ///
+    /// If the string (slice) already exists, return its reference instead.
+    fn insert_or_get<T>(&self, s: T) -> StoredStr
+    where
+        T: Into<String>,
+    {
+        let s: String = s.into();
+        if s.is_empty() {
+            return StoredStr(0, self);
+        }
+        if !self.contains(&s) {
+            self.insert_unchecked(s.clone());
+        }
+        self.get_ref(&s).unwrap()
     }
 
     /// Store the parts and return their indices.
@@ -548,48 +566,6 @@ impl UniqueStrStore {
     }
 }
 
-/**
-This trait allows locking certain methods behind a shared reference.
-
-For now, this concerns methods which return a [StoredStr] reference, as that
-struct needs a stable pointer to the [UniqueStrStore] to function properly.
-*/
-pub trait SharedStrStore {
-    type Inner: Deref<Target = UniqueStrStore>;
-
-    fn get_ref(&self, s: &str) -> Option<StoredStr>;
-    fn insert_or_get<T>(&self, s: T) -> StoredStr
-    where
-        T: Into<String>;
-}
-
-impl SharedStrStore for Arc<UniqueStrStore> {
-    type Inner = Self;
-
-    /// The reference of a stored string slice, if it exists.
-    #[inline]
-    fn get_ref(&self, s: &str) -> Option<StoredStr> {
-        self.idx(s).map(|idx: u32| StoredStr(idx, self.clone()))
-    }
-
-    /// Insert a new string (slice) and return its [StoredStr] reference.
-    ///
-    /// If the string (slice) already exists, return its reference instead.
-    fn insert_or_get<T>(&self, s: T) -> StoredStr
-    where
-        T: Into<String>,
-    {
-        let s: String = s.into();
-        if s.is_empty() {
-            return StoredStr(0, self.clone());
-        }
-        if !self.contains(&s) {
-            self.insert_unchecked(s.clone());
-        }
-        self.get_ref(&s).unwrap()
-    }
-}
-
 // We have to implement our own since `size_of::SizeOf` does not support
 // `RwLock` nor `DashMap`.
 impl SizeOf for UniqueStrStore {
@@ -625,9 +601,9 @@ This is a self-contained version which has a reference back to the store,
 which allows it to be used in place of a "normal" string slice.
 */
 #[derive(Clone)]
-pub struct StoredStr(u32, Arc<UniqueStrStore>);
+pub struct StoredStr<'a>(u32, &'a UniqueStrStore);
 
-impl StoredStr {
+impl<'a> StoredStr<'a> {
     #[inline]
     /// This method is safe to call, as our reference is guaranteed to be valid.
     fn reference(&self) -> &str {
@@ -652,13 +628,13 @@ impl StoredStr {
 
 /* --------------------------------- */
 
-impl AsRef<str> for StoredStr {
+impl<'a> AsRef<str> for StoredStr<'a> {
     fn as_ref(&self) -> &str {
         self.reference()
     }
 }
 
-impl Deref for StoredStr {
+impl<'a> Deref for StoredStr<'a> {
     type Target = str;
 
     fn deref(&self) -> &Self::Target {
@@ -668,27 +644,27 @@ impl Deref for StoredStr {
 
 /* --------------------------------- */
 
-impl Eq for StoredStr {}
+impl<'a> Eq for StoredStr<'a> {}
 
-impl PartialEq for StoredStr {
+impl<'a> PartialEq for StoredStr<'a> {
     fn eq(&self, other: &Self) -> bool {
         self.reference() == other.reference()
     }
 }
 
-impl PartialOrd for StoredStr {
+impl<'a> PartialOrd for StoredStr<'a> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         self.reference().partial_cmp(&other.reference())
     }
 }
 
-impl Ord for StoredStr {
+impl<'a> Ord for StoredStr<'a> {
     fn cmp(&self, other: &Self) -> Ordering {
         self.reference().cmp(&other.reference())
     }
 }
 
-impl Hash for StoredStr {
+impl<'a> Hash for StoredStr<'a> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.reference().hash(state)
     }
@@ -696,13 +672,13 @@ impl Hash for StoredStr {
 
 /* --------------------------------- */
 
-impl Debug for StoredStr {
+impl<'a> Debug for StoredStr<'a> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         write!(f, "StoredStr({}: {:?})", self.0, self.reference())
     }
 }
 
-impl Display for StoredStr {
+impl<'a> Display for StoredStr<'a> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.reference())
     }
@@ -710,13 +686,13 @@ impl Display for StoredStr {
 
 /* --------------------------------- */
 
-impl PartialEq<StoredStr> for &str {
+impl<'a> PartialEq<StoredStr<'a>> for &str {
     fn eq(&self, other: &StoredStr) -> bool {
         *self == other.reference()
     }
 }
 
-impl PartialEq<&str> for StoredStr {
+impl<'a> PartialEq<&str> for StoredStr<'a> {
     fn eq(&self, other: &&str) -> bool {
         self.reference() == *other
     }
@@ -725,13 +701,13 @@ impl PartialEq<&str> for StoredStr {
 /* --------------------------------- */
 
 // Implement `From` for converting `StoredStr` into `u32`.
-impl<'a> From<StoredStr> for u32 {
+impl<'a> From<StoredStr<'a>> for u32 {
     fn from(v: StoredStr) -> u32 {
         v.0
     }
 }
 
-impl<'a> From<StoredStr> for &'a str {
+impl<'a> From<StoredStr<'a>> for &'a str {
     fn from(v: StoredStr) -> &'a str {
         unsafe {
             let ptr: *const str = (*v.1).get_raw(v.0) as *const str;
@@ -1255,7 +1231,7 @@ mod tests {
         use std::thread;
 
         let exp_len: usize = CONC_S_NUM + LATIN1_NUM as usize;
-        let store: Arc<UniqueStrStore> = UniqueStrStore::new_with_capacity(exp_len).shared();
+        let store: UniqueStrStore = UniqueStrStore::new_with_capacity(exp_len);
 
         let threads: Vec<_> = (0..CONC_T_NUM)
             .map(|t: usize| {
@@ -1284,7 +1260,7 @@ mod tests {
 
         let per_thread: usize = CONC_S_NUM / CONC_T_NUM;
         let exp_len: usize = per_thread + LATIN1_NUM as usize;
-        let store: Arc<UniqueStrStore> = UniqueStrStore::new_with_capacity(exp_len).shared();
+        let store: UniqueStrStore = UniqueStrStore::new_with_capacity(exp_len);
 
         let threads: Vec<_> = (0..CONC_T_NUM)
             .map(|_t| {
