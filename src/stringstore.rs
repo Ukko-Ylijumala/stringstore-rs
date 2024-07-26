@@ -135,7 +135,8 @@ impl UniqueStrStore {
             index: DashMap::with_capacity_and_hasher(
                 capacity,
                 CustomXxh3Hasher::default().build_hasher(),
-            ).into(),
+            )
+            .into(),
             ascii: latin1.into(),
             len: AtomicCell::new(LATIN1_NUM).into(),
         }
@@ -193,19 +194,21 @@ impl UniqueStrStore {
         if idx as usize >= len {
             return Err("Index {idx} out of bounds (max: {len})".to_string());
         }
-        unsafe { Ok(self.get_raw(idx)) }
+        unsafe { Ok(self.borrow_str(idx)) }
     }
 
     /**
-    Returns a raw reference to a stored [str]. For a safe alternative, use `get`.
-
-    ### Safety
-    Calling this method with an out-of-bounds index will panic.
+    Get a raw pointer by index to a string slice in the store.
+    Does no bounds checking apart from deciding whether to get the pointer
+    from the ISO-8859-1 range Vec, or from the store Vec.
 
     ### Details
-    Since we're going through a [RwLock], we need to do some extra pointer
-    magic, as returning a [Box::as_ref()] directly would make the borrow
-    checker complain about "cannot return value referencing local variable".
+    If we're going through a [RwLock], we need to do some extra pointer
+    magic, as returning a [Box::as_ref] directly would make the borrow
+    checker complain of "cannot return value referencing local variable".
+
+    This is safe because we're returning a pointer to a stored string in the
+    heap, which shouldn't move, while the owning [Box] could be moved around.
 
     This should work too, but is more complicated:
     ```ignore
@@ -215,21 +218,31 @@ impl UniqueStrStore {
     std::str::from_utf8_unchecked(bytes)
     */
     #[inline]
-    pub unsafe fn get_raw<'a>(&'a self, idx: u32) -> &'a str {
+    unsafe fn get_str_ptr<'a>(&'a self, idx: u32) -> *const str {
         // ISO-8859-1 range
         if idx < LATIN1_NUM {
-            return &*self.ascii[idx as usize];
+            return self.ascii[idx as usize].as_ref() as *const str;
+        } else {
+            let store = self.store.read();
+            let b: &Box<str> = store.get_unchecked((idx - LATIN1_NUM) as usize);
+            b.as_ref() as *const str
         }
+    }
 
-        let idx: u32 = idx - LATIN1_NUM;
-        let store = self.store.read();
-        if idx as usize >= store.len() {
-            panic!("Store index {idx} out of bounds (max: {})", store.len());
+    /**
+    Borrow a raw reference to a stored [str]. For a safe alternative, use `get`.
+
+    ### Safety
+    Calling this method with an out-of-bounds index will panic.
+    */
+    #[inline]
+    pub unsafe fn borrow_str<'a>(&'a self, idx: u32) -> &'a str {
+        if idx > LATIN1_NUM && (idx - LATIN1_NUM) as usize >= self.store.read().len() {
+            panic!("Store index {idx} out of bounds (max: {})", self.len());
+        } else {
+            let ptr: *const str = self.get_str_ptr(idx);
+            &*ptr
         }
-
-        let b: &Box<str> = store.get_unchecked(idx as usize);
-        let ptr: *const str = b.as_ref() as *const str;
-        &*ptr
     }
 
     /**
@@ -595,6 +608,102 @@ impl SizeOf for UniqueStrStore {
 /* ######################################################################### */
 
 /**
+Pointer to a string slice living in a [UniqueStrStore]. This is the return
+type of [StoredStr::as_ptr].
+
+NOTE: this pointer is only valid as long as the store is alive. The lifetime
+is not enforced, as the store is expected to outlive any references to its
+contents. This is the responsibility of the user of this struct to enforce.
+*/
+#[derive(Clone, PartialEq, Eq)]
+pub struct StoredStrPtr(*const str);
+
+impl StoredStrPtr {
+    #[inline]
+    pub fn as_str(&self) -> &str {
+        unsafe { &*self.0 }
+    }
+
+    pub fn to_string(&self) -> String {
+        unsafe { &*self.0 }.to_string()
+    }
+}
+
+/* --------------------------------- */
+
+impl AsRef<str> for StoredStrPtr {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl Deref for StoredStrPtr {
+    type Target = *const str;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+/* --------------------------------- */
+
+impl PartialOrd for StoredStrPtr {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        self.as_str().partial_cmp(&other.as_str())
+    }
+}
+
+impl Ord for StoredStrPtr {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.as_str().cmp(&other.as_str())
+    }
+}
+
+impl Hash for StoredStrPtr {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.as_str().hash(state)
+    }
+}
+
+/* --------------------------------- */
+
+impl Debug for StoredStrPtr {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "StoredStrPtr({:?} -> {:?})", self.0, self.as_str())
+    }
+}
+
+impl Display for StoredStrPtr {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+/* --------------------------------- */
+
+impl PartialEq<StoredStrPtr> for &str {
+    fn eq(&self, other: &StoredStrPtr) -> bool {
+        *self == other.as_str()
+    }
+}
+
+impl PartialEq<&str> for StoredStrPtr {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
+
+/* --------------------------------- */
+
+impl<'a> From<StoredStrPtr> for &'a str {
+    fn from(v: StoredStrPtr) -> &'a str {
+        unsafe { &*v.0 }
+    }
+}
+
+/* ######################################################################### */
+
+/**
 A reference (index) to a stored string slice in a [UniqueStrStore].
 
 This is a self-contained version which has a reference back to the store,
@@ -604,10 +713,14 @@ which allows it to be used in place of a "normal" string slice.
 pub struct StoredStr<'a>(u32, &'a UniqueStrStore);
 
 impl<'a> StoredStr<'a> {
-    #[inline]
     /// This method is safe to call, as our reference is guaranteed to be valid.
+    #[inline]
     fn reference(&self) -> &str {
-        unsafe { (*self.1).get_raw(self.0) }
+        unsafe { (*self.1).borrow_str(self.0) }
+    }
+
+    pub fn as_ptr(&self) -> StoredStrPtr {
+        StoredStrPtr(unsafe { (*self.1).get_str_ptr(self.0) })
     }
 
     /// Get the index of the stored string slice.
@@ -710,7 +823,7 @@ impl<'a> From<StoredStr<'a>> for u32 {
 impl<'a> From<StoredStr<'a>> for &'a str {
     fn from(v: StoredStr) -> &'a str {
         unsafe {
-            let ptr: *const str = (*v.1).get_raw(v.0) as *const str;
+            let ptr: *const str = (*v.1).borrow_str(v.0) as *const str;
             &*ptr
         }
     }
@@ -734,7 +847,7 @@ impl CompactStr {
     }
 
     fn get<'a>(&self, store: &'a UniqueStrStore) -> &'a str {
-        unsafe { store.get_raw(self.0) }
+        unsafe { store.borrow_str(self.0) }
     }
 
     fn to_string(&self, store: &UniqueStrStore) -> String {
@@ -758,7 +871,7 @@ impl Character {
     }
 
     fn get<'a>(&self, store: &'a UniqueStrStore) -> &'a str {
-        unsafe { store.get_raw(self.idx()) }
+        unsafe { store.borrow_str(self.idx()) }
     }
 
     fn to_string(&self, store: &UniqueStrStore) -> String {
@@ -1194,7 +1307,14 @@ mod tests {
         assert_eq!(store.len(), num, "Store length should be {num}");
         assert!(store.contains(HELLO), "Store does not contain '{HELLO}': {store:?}");
         assert_eq!(store.get(i).unwrap(), HELLO, "get({i}) should == '{HELLO}'");
-        assert_eq!(unsafe { store.get_raw(i) }, HELLO, "get_unchecked({i}) should == '{HELLO}'");
+        assert_eq!(unsafe { store.borrow_str(i) }, HELLO, "get_unchecked({i}) should == '{HELLO}'");
+
+        // Test the pointer structs.
+        let stored: StoredStr = store.get_ref(HELLO).expect("StoredStr should be returned");
+        assert_eq!(stored.idx(), i, "StoredStr index should be {i}");
+        let ptr: StoredStrPtr = stored.as_ptr();
+        assert!(!ptr.is_null(), "StoredStrPtr should not be null: {ptr:?}");
+        assert_eq!(ptr.as_str(), HELLO, "Pointer string should be '{HELLO}': {ptr:?}");
     }
 
     #[test]
@@ -1219,7 +1339,7 @@ mod tests {
         assert_eq!(stored, again, "StoredStr instances should be equal: {stored:?} != {again:?}");
         assert_eq!(store.get(start).unwrap(), HELLO, "get({start}) should == '{HELLO}'");
         assert_eq!(
-            unsafe { store.get_raw(start + 1) },
+            unsafe { store.borrow_str(start + 1) },
             foo_s,
             "get_unchecked({}) should == '{foo_s}'",
             start + 1
@@ -1310,7 +1430,7 @@ mod tests {
         // Check that the original string can be reconstructed
         let built: String = indices
             .iter()
-            .map(|&idx| unsafe { store.get_raw(idx) })
+            .map(|&idx| unsafe { store.borrow_str(idx) })
             .collect::<Vec<&str>>()
             .join(delim);
 
@@ -1369,7 +1489,7 @@ mod tests {
         // Check that the original string can be reconstructed
         let built: String = parts1
             .iter()
-            .map(|&idx| unsafe { store.get_raw(idx) })
+            .map(|&idx| unsafe { store.borrow_str(idx) })
             .collect::<Vec<&str>>()
             .join(PATH_SEP);
 
