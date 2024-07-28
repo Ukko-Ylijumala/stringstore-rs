@@ -84,7 +84,7 @@ assert_eq!(store.len(), 256); // incl. ISO-8859-1 codepoints
 let hello_id = store.insert(hello);
 assert_eq!(store.len(), 256 + 1);
 assert!(store.contains(hello));
-assert_eq!(hello_id, 256, "hello string stored at index 256");
+assert_eq!(hello_id, 256, "hello string should be stored at index 256");
 
 // try to insert the same string again
 let hello_id2 = store.insert(hello);
@@ -93,10 +93,10 @@ assert_eq!(store.get(hello_id).unwrap(), hello);
 
 let foo_id = store.insert("foo");
 assert_eq!(store.len(), 256 + 2);
-assert_eq!(foo_id, 257, "foo string stored at index 257");
+assert_eq!(foo_id, 257, "foo string should be stored at index 257");
 
 // panics if the index is out of bounds
-assert_eq!(unsafe { store.get_raw(foo_id) }, "foo");
+assert_eq!(unsafe { store.borrow_str(foo_id) }, "foo");
 
 // check internal consistency
 store.validate_contents().expect("Store validation failed");
