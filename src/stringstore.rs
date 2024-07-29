@@ -246,6 +246,19 @@ impl UniqueStrStore {
     }
 
     /**
+    Get a pointer to a stored string slice.
+
+    WARNING: THIS IS AN UNSAFE FN AND SHOULD BE USED WITH CAUTION.
+    NO BOUNDS CHECKING IS PERFORMED
+
+    NOTE: The pointer is only valid as long as the store is alive, but this
+    is not enforced. The lifetime is the responsibility of the user.
+    */
+    pub unsafe fn get_ptr(&self, idx: u32) -> StoredStrPtr {
+        StoredStrPtr(self.get_str_ptr(idx))
+    }
+
+    /**
     Insert a new string foregoing the first index check before write locking.
 
     We still must check again after acquiring the write locks, as another
