@@ -12,6 +12,7 @@ use regex::{escape, Regex};
 use size_of::{Context, SizeOf};
 use std::{
     cmp::Ordering,
+    error::Error,
     fmt::{self, Debug, Display, Formatter},
     hash::{BuildHasher, Hash, Hasher},
     mem,
@@ -187,10 +188,10 @@ impl UniqueStrStore {
     }
 
     /// Get a reference to a stored string slice by its index, if it exists.
-    pub fn get<'a>(&'a self, idx: u32) -> Result<&'a str, String> {
+    pub fn get<'a>(&'a self, idx: u32) -> StringStoreResult<&'a str> {
         let len: usize = self.len();
         if idx as usize >= len {
-            return Err("Index {idx} out of bounds (max: {len})".to_string());
+            return Err(StringStoreError::oob(idx, len - 1));
         }
         unsafe { Ok(self.borrow_str(idx)) }
     }
@@ -487,13 +488,16 @@ impl UniqueStrStore {
         .collect::<Vec<&str>>()
         .join(store.get(delim).unwrap());
     */
-    pub fn reconstruct(&self, indices: &[u32], delim: u32) -> Result<String, String> {
+    pub fn reconstruct(&self, indices: &[u32], delim: u32) -> StringStoreResult<String> {
         let parts_num: usize = indices.len();
         // special case: empty string
         if parts_num == 0 || (parts_num == 1 && indices[0] == 0) {
             return Ok(EMPTY_STR.to_string());
         } else if parts_num > u32::MAX as usize {
-            return Err("Size is larger than u32::MAX".to_string());
+            return Err(StringStoreError::ReconstructionTooLarge {
+                requested: parts_num,
+                max: u32::MAX as usize,
+            });
         }
 
         // delimiter check
@@ -501,7 +505,10 @@ impl UniqueStrStore {
         let store = self.store.read();
         let stored_num: u32 = self.len() as u32;
         if delim >= stored_num {
-            return Err("Delimiter index {idx} out of bounds".to_string());
+            return Err(StringStoreError::IndexOutOfBounds {
+                idx: delim,
+                max: (stored_num - 1) as usize,
+            });
         }
 
         // get the delimiter string
@@ -514,7 +521,7 @@ impl UniqueStrStore {
         let mut result: String = String::new();
         for (i, idx) in indices.iter().enumerate() {
             if idx >= &stored_num {
-                return Err("String index {idx} (pos: {i}) out of bounds".to_string());
+                return Err(StringStoreError::reconstruction(*idx, i, stored_num));
             }
 
             if idx != &0 {
@@ -1224,6 +1231,84 @@ fn return_iso8859_1_cp(s: &str) -> Option<u32> {
     None
 }
 
+/* ############################# ERROR HANDLING ############################ */
+
+/// Error type for string store operations.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StringStoreError {
+    /// Index out of bounds error. Contains the invalid index and max index.
+    IndexOutOfBounds { idx: u32, max: usize },
+    /// Error when the store has reached its maximum capacity (u32::MAX).
+    StoreFull,
+    /// Error when attempting to reconstruct a string with invalid parts.
+    /// Contains details about which part caused the error.
+    InvalidReconstruction { idx: u32, pos: usize, max: u32 },
+    /// Error when string reconstruction would exceed the maximum allowed size.
+    ReconstructionTooLarge { requested: usize, max: usize },
+    /// Error when a string contains invalid UTF-8 sequences.
+    InvalidUtf8(String),
+    /// Error when path contains invalid characters or sequences.
+    InvalidPath(String),
+    /// Error when delimiter is invalid (e.g., empty when not allowed).
+    InvalidDelimiter(String),
+    /// Internal error, used when invariants are violated. Should never happen normally.
+    InternalError(String),
+}
+
+impl Error for StringStoreError {}
+
+impl Display for StringStoreError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::IndexOutOfBounds { idx, max } => {
+                write!(f, "index {idx} out of bounds (max: {max})")
+            }
+            Self::StoreFull => write!(f, "string store has reached maximum capacity"),
+            Self::InvalidReconstruction { idx, pos, max } => {
+                write!(f, "invalid index {idx} at position {pos} (max: {max})")
+            }
+            Self::ReconstructionTooLarge { requested, max } => {
+                write!(f, "too many indexes to reconstruct (requested: {requested}, max: {max})")
+            }
+            Self::InvalidUtf8(info) => write!(f, "invalid UTF-8 sequence: {info}"),
+            Self::InvalidPath(info) => write!(f, "invalid path: {info}"),
+            Self::InvalidDelimiter(info) => write!(f, "invalid delimiter: {info}"),
+            Self::InternalError(info) => write!(f, "internal error: {info}"),
+        }
+    }
+}
+
+/// Type alias for Result with StringStoreError.
+pub type StringStoreResult<T> = Result<T, StringStoreError>;
+
+// Helper methods for creating errors
+impl StringStoreError {
+    /// Create a new IndexOutOfBounds error.
+    pub fn oob(idx: u32, max: usize) -> Self {
+        Self::IndexOutOfBounds { idx, max }
+    }
+
+    /// Create a new InvalidReconstruction error.
+    pub fn reconstruction(idx: u32, pos: usize, max: u32) -> Self {
+        Self::InvalidReconstruction { idx, pos, max }
+    }
+
+    /// Create a new InvalidPath error with details.
+    pub fn path<S: Into<String>>(info: S) -> Self {
+        Self::InvalidPath(info.into())
+    }
+
+    /// Create a new InvalidDelimiter error with details.
+    pub fn delimiter<S: Into<String>>(info: S) -> Self {
+        Self::InvalidDelimiter(info.into())
+    }
+
+    /// Create a new InternalError with details.
+    pub fn internal_error<S: Into<String>>(info: S) -> Self {
+        Self::InternalError(info.into())
+    }
+}
+
 /* ################################ TESTS ################################## */
 
 mod tests {
@@ -1577,5 +1662,26 @@ mod tests {
             store.reconstruct(&parts3, store.idx(PATH_SEP).unwrap()).unwrap(),
             "input <-> reconstruct() mismatch (path3)"
         );
+    }
+
+    #[test]
+    fn test_error_display() {
+        let err = StringStoreError::oob(42, 10);
+        assert_eq!(err.to_string(), "index 42 out of bounds (max: 10)");
+
+        let err = StringStoreError::reconstruction(5, 2, 4);
+        assert_eq!(err.to_string(), "invalid index 5 at position 2 (max: 4)");
+
+        let err = StringStoreError::InvalidPath("contains null byte".to_string());
+        assert_eq!(err.to_string(), "invalid path: contains null byte");
+    }
+
+    #[test]
+    fn test_error_debug() {
+        let err = StringStoreError::StoreFull;
+        assert_eq!(format!("{err:?}"), "StoreFull");
+
+        let err = StringStoreError::delimiter("Empty delimiter");
+        assert_eq!(format!("{err:?}"), r#"InvalidDelimiter("Empty delimiter")"#);
     }
 }
