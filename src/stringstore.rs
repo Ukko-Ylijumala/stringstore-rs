@@ -161,8 +161,7 @@ impl UniqueStrStore {
         }
 
         if s.len() == 1 {
-            let c: u32 = s.chars().next().unwrap() as u32;
-            if c < LATIN1_NUM {
+            if return_iso8859_1_cp(s).is_some() {
                 return true; // ISO-8859-1 implicitly contained
             }
         }
@@ -177,8 +176,7 @@ impl UniqueStrStore {
         }
 
         if s.len() == 1 {
-            let c: u32 = s.chars().next().unwrap() as u32;
-            if c < LATIN1_NUM {
+            if let Some(c) = return_iso8859_1_cp(s) {
                 return Some(c);
             }
         }
@@ -292,8 +290,7 @@ impl UniqueStrStore {
         }
 
         if s.len() == 1 {
-            let c: u32 = s.chars().next().unwrap() as u32;
-            if c < LATIN1_NUM {
+            if let Some(c) = return_iso8859_1_cp(&s) {
                 return c; // ISO-8859-1 code point
             }
         }
@@ -1094,7 +1091,7 @@ macro_rules! impl_integer {
 
 impl_integer!(i8, i16, i32, i64, i128, isize, u8, u16, u32, u64, u128, usize);
 
-/* ######################################################################### */
+/* ############################# TOKENIZATION ############################## */
 
 #[derive(Default, Debug, PartialEq, Eq)]
 /// A token (part) of a delimited string, which has been processed (tokenized).
@@ -1203,7 +1200,20 @@ pub fn tokenize_regex(s: &str, delims: &[&str]) -> Vec<Token> {
     tokens
 }
 
-/* ######################################################################### */
+/* ########################## UTILITY FUNCTIONS ############################ */
+
+/// Check whether the first character of a string is an ISO-8859-1 codepoint,
+/// and if so, return it. Otherwise, return None. Zero-length string will panic.
+#[inline]
+fn return_iso8859_1_cp(s: &str) -> Option<u32> {
+    let c: u32 = s.chars().next().unwrap() as u32;
+    if c < LATIN1_NUM {
+        return Some(c);
+    }
+    None
+}
+
+/* ################################ TESTS ################################## */
 
 mod tests {
     #[allow(unused_imports)]
