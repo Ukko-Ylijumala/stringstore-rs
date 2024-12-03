@@ -374,13 +374,18 @@ impl UniqueStrStore {
 
     First, the delimiters provided in `delims` are stored, then the string
     `s` is split based on these delimiters. Each unique part obtained from
-    splitting is stored and its index returned. A simple tokenizer is used
-    for shorter strings, while a regex-based tokenizer handles longer strings
-    and/or larger sets of delimiters.
+    splitting is stored and its index returned. By default, a simple tokenizer
+    is used for shorter strings, while a regex-based tokenizer handles longer
+    strings and/or larger sets of delimiters. This can be overridden by the
+    `force_regex` optional boolean.
 
     ## Arguments
     * `s` - a string slice to be atomized
     * `delims` - string slices, based on which `s` shall be split
+    * `force_regex` - whether to use the regex-based tokenizer
+      - `None` - auto-detect based on string length and number of delimiters
+      - `Some(true)` - force regex-based tokenizer
+      - `Some(false)` - force simple tokenizer
 
     ## Returns
     A tuple of two [Vec]s:
@@ -396,10 +401,17 @@ impl UniqueStrStore {
     differing results for the same input, especially if there is any overlap
     between the provided delimiters. YMMV, buyer beware etc. (WIP)
     */
-    pub fn split_and_store_multi(&self, s: &str, delims: &[&str]) -> (Vec<u32>, Vec<u32>) {
+    pub fn split_and_store_multi(
+        &self,
+        s: &str,
+        delims: &[&str],
+        force_regex: Option<bool>,
+    ) -> (Vec<u32>, Vec<u32>) {
         let complexity: usize = s.len() * delims.len(); // rough estimate
         let mut result: Vec<u32> = vec![];
         let mut delim_indices: Vec<u32> = vec![];
+        // TODO: evaluate thresholds for switching between tokenizers
+        let regex: bool = force_regex.unwrap_or_else(|| (complexity > 10000 || delims.len() > 10));
 
         if !delims.is_empty() {
             // store the delimiters first
@@ -420,8 +432,7 @@ impl UniqueStrStore {
             return (vec![self.insert(s)], vec![]);
         }
 
-        // TODO: evaluate thresholds for switching between tokenizers
-        if complexity < 10000 || delims.len() <= 10 {
+        if !regex {
             // use the simple tokenizer for shorter strings
             for token in tokenize(s, delims).iter() {
                 result.push(self.insert(&token.content));
