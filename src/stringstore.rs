@@ -1,4 +1,4 @@
-// Copyright (c) 2024 Mikko Tanner. All rights reserved.
+// Copyright (c) 2024-2025 Mikko Tanner. All rights reserved.
 
 #![allow(dead_code)]
 
@@ -9,7 +9,6 @@ use crossbeam::atomic::AtomicCell;
 use dashmap::DashMap;
 use parking_lot::RwLock;
 use regex::{escape, Regex};
-use size_of::{Context, SizeOf};
 use std::{
     cmp::Ordering,
     error::Error,
@@ -23,6 +22,9 @@ use std::{
     sync::Arc,
 };
 //use uuid::Uuid;
+
+#[cfg(feature = "size_of")]
+use size_of::{Context, SizeOf};
 
 const EMPTY_STR: &str = "";
 const PATH_SEP: &str = "/";
@@ -609,6 +611,7 @@ impl UniqueStrStore {
 
 // We have to implement our own since `size_of::SizeOf` does not support
 // `RwLock` nor `DashMap`.
+#[cfg(feature = "size_of")]
 impl SizeOf for UniqueStrStore {
     fn size_of_children(&self, context: &mut Context) {
         self.store.read().size_of_children(context);
