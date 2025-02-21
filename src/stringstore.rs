@@ -3,7 +3,6 @@
 #![allow(dead_code)]
 
 use crate::hashing::{hash_bytes, CustomXxh3Hasher};
-use crate::timesince::SecondsSinceEpoch;
 use crate::utils::normalize_path;
 use crossbeam::atomic::AtomicCell;
 use dashmap::DashMap;
@@ -21,6 +20,7 @@ use std::{
     str::{FromStr, Split},
     sync::Arc,
 };
+use timesince::SecondsSinceEpoch;
 //use uuid::Uuid;
 
 #[cfg(feature = "size_of")]
