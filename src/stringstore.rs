@@ -2,8 +2,11 @@
 
 #![allow(dead_code)]
 
-use crate::hashing::{hash_bytes, CustomXxh3Hasher};
-use crate::utils::normalize_path;
+use crate::{
+    hashing::{hash_bytes, CustomXxh3Hasher},
+    utils::normalize_path,
+    PATH_SEP,
+};
 use crossbeam::atomic::AtomicCell;
 use dashmap::DashMap;
 use parking_lot::RwLock;
@@ -27,7 +30,6 @@ use timesince::SecondsSinceEpoch;
 use size_of::{Context, SizeOf};
 
 const EMPTY_STR: &str = "";
-const PATH_SEP: &str = "/";
 const LATIN1_NUM: u32 = 256;
 
 /**
