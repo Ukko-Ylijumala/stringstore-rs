@@ -2,12 +2,9 @@
 
 #![allow(dead_code)]
 
-use crate::{
-    hashing::{hash_bytes, CustomXxh3Hasher},
-    utils::normalize_path,
-    PATH_SEP,
-};
+use crate::{utils::normalize_path, PATH_SEP};
 use crossbeam::atomic::AtomicCell;
+use custom_xxh3::{hash_bytes, CustomXxh3Hasher};
 use dashmap::DashMap;
 use parking_lot::RwLock;
 use regex::{escape, Regex};
