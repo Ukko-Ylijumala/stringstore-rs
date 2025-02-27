@@ -1,0 +1,35 @@
+[package]
+name = "stringstore"
+version = "0.3.5"
+authors = ["Mikko Tanner <mikko.tanner@gmail.com>"]
+description = "String interning library for Rust"
+repository = "https://github.com/Ukko-Ylijumala/stringstore-rs"
+readme = "README.md"
+license = "MIT OR Apache-2.0"
+categories = ["data-structures", ""]
+keywords = ["string", "interning"]
+publish = false
+edition = "2021"
+
+[features]
+#default = ["size_of"]
+size_of = ["dep:size-of"]
+
+[dependencies]
+crossbeam = "0.8"
+parking_lot = "0.12"
+regex = "1.10"
+size-of = { version = "0.1", optional = true }
+
+[dependencies.dashmap]
+version = "6.0"
+
+[dependencies.custom_xxh3]
+git = "https://github.com/Ukko-Ylijumala/custom_xxh3"
+features = ["size_of"]
+
+[dependencies.timesince]
+git = "https://github.com/Ukko-Ylijumala/timesince-rs"
+
+[dependencies.miniutils]
+git = "https://github.com/Ukko-Ylijumala/miniutils-rs"
