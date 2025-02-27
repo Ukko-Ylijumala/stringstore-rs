@@ -78,7 +78,7 @@ non-bounds-checking lookup (meant mostly for internal use with known indices).
 
 ## Example
 ```
-use statter::stringstore::UniqueStrStore;
+use stringstore::UniqueStrStore;
 
 let hello: &'static str = "Hello, world!";
 let store = UniqueStrStore::new();
