@@ -2,10 +2,10 @@
 
 #![allow(dead_code)]
 
-use crate::{utils::normalize_path, PATH_SEP};
 use crossbeam::atomic::AtomicCell;
 use custom_xxh3::{hash_bytes, CustomXxh3Hasher};
 use dashmap::DashMap;
+use miniutils::normalize_path;
 use parking_lot::RwLock;
 use regex::{escape, Regex};
 use std::{
@@ -27,6 +27,7 @@ use timesince::SecondsSinceEpoch;
 use size_of::{Context, SizeOf};
 
 const EMPTY_STR: &str = "";
+const PATH_SEP: &str = "/";
 const LATIN1_NUM: u32 = 256;
 
 /**
@@ -469,7 +470,7 @@ impl UniqueStrStore {
     where
         P: AsRef<Path>,
     {
-        let s: PathBuf = normalize_path(s);
+        let s: PathBuf = normalize_path(s, false);
         if s.as_os_str().is_empty() {
             return [0].into();
         }
