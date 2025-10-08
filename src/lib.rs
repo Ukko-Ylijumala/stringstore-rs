@@ -308,14 +308,14 @@ impl UniqueStrStore {
 
     /// The reference of a stored string slice, if it exists.
     #[inline]
-    fn get_ref(&self, s: &str) -> Option<StoredStr> {
+    fn get_ref(&'_ self, s: &str) -> Option<StoredStr<'_>> {
         self.idx(s).map(|idx: u32| StoredStr(idx, self))
     }
 
     /// Insert a new string (slice) and return its [StoredStr] reference.
     ///
     /// If the string (slice) already exists, return its reference instead.
-    fn insert_or_get<T>(&self, s: T) -> StoredStr
+    fn insert_or_get<T>(&'_ self, s: T) -> StoredStr<'_>
     where
         T: Into<String>,
     {
