@@ -414,7 +414,7 @@ impl UniqueStrStore {
         let mut result: Vec<u32> = vec![];
         let mut delim_indices: Vec<u32> = vec![];
         // TODO: evaluate thresholds for switching between tokenizers
-        let regex: bool = force_regex.unwrap_or_else(|| (complexity > 10000 || delims.len() > 10));
+        let regex: bool = force_regex.unwrap_or_else(|| complexity > 10000 || delims.len() > 10);
 
         if !delims.is_empty() {
             // store the delimiters first
