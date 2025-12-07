@@ -19,7 +19,12 @@ size_of = ["dep:size-of"]
 crossbeam = "0.8"
 parking_lot = "0.12"
 regex = "1.10"
-size-of = { version = "0.1", optional = true }
+#size-of = { version = "0.1", optional = true }
+
+[dependencies.size-of]
+git = "https://github.com/Ukko-Ylijumala/size-of"
+version = "0.1.7"
+optional = true
 
 [dependencies.dashmap]
 version = "6.0"
