@@ -1,94 +1,74 @@
-# Stringstore - a string interning library for Rust
+# stringstore
 
-## Overview
-**StringStore** is a Rust library that provides memory efficient and thread-safe string interning and deduplication functionality for unique string slices with stable indexing. This should significantly reduce memory usage in scenarios where many duplicate strings need to be stored in memory.
+A memory-efficient, thread-safe string interning library for Rust with stable `u32` indices.
 
-## Features
-- Efficient: each unique string is stored only once.
-- Fast lookups: O(1) average complexity for both index and content-based lookups.
-- Stable indexing: once a string is stored, its index remains constant.
-- Allocations: uses [Box<str>] for heap allocation of strings.
-- the empty string ("") always occupies the first index (0).
-- ISO-8859-1 codepoints: contained explicitly, at indices 1-255 (minus '\0').
+> **Status: heavily WIP.** This crate is pre-1.0 (currently `0.3.x`) and *not* published to crates.io. APIs, internal layout, error variants, and tokenizer behavior may all change without notice. The dormant `TextElement` / `StructuredLine` scaffolding in `src/lib.rs` is an explicit work-in-progress and is not part of the supported surface. If you depend on this crate, pin to an exact git rev.
 
-## Design Considerations
-- Uses a [Vec<Box<str>>] for string storage, which is efficient for random access, and should help with cache locality as well.
-- Uses a [DashMap] with `u64` Xxh3 string hashes as keys for fast lookups.
-- Custom [xxhash_rust] hasher ([CustomXxh3Hasher]) for potentially faster hashing.
-- Thread-safe.
-- trait [SizeOf]: provides a way to measure the size of the structure in memory.
-- ISO-8859-1: separate non-locking [Vec] for indices 0-255 to avoid locking and hashing overhead for common characters.
-- First inserted string is always at index 256.
+## What it does
 
-## Performance Characteristics
-- Insertion: O(1) average
-- Lookup by content: O(1) average
-- Lookup by index: O(1)
-- Memory overhead: small fixed cost per unique string
+`UniqueStrStore` stores each distinct string once and hands out a stable `u32` index for it. Subsequent inserts of the same string return the same index. Both lookup-by-index and lookup-by-content are O(1) average.
 
-## Usage
-This structure should work nicely for scenarios where you need to store many duplicate strings and require fast lookups by both content and stable indices.
+Indices are append-only — once assigned, an index never changes and never points to a different string. There is no removal API.
 
-## Safety
-While most operations are safe, the `get_unchecked` method provides an unsafe, non-bounds-checking lookup (meant mostly for internal use with known indices).
+The first 256 indices are reserved for ISO-8859-1 codepoints (with `""` at index 0). Single-character ASCII / Latin-1 strings short-circuit the hash map entirely, so common tokens like spaces and punctuation are essentially free to insert.
 
-## Limitations
-- Does not support string removal to maintain index stability.
-- Does not support string modification after insertion.
-- No partial deduplication of strings (e.g. substrings).
-- The maximum number of unique strings is limited by the [u32] index.
+## Quick example
+
+```rust
+use stringstore::UniqueStrStore;
+
+let store = UniqueStrStore::new();
+assert_eq!(store.len(), 256); // ISO-8859-1 codepoints are pre-populated
+
+let hello = store.insert("Hello, world!");
+assert_eq!(hello, 256); // first user-inserted string
+
+// inserting again returns the same index
+assert_eq!(store.insert("Hello, world!"), hello);
+
+// retrieve by index
+assert_eq!(store.get(hello).unwrap(), "Hello, world!");
+
+// internal consistency check (panics in debug, returns Err in release)
+store.validate_contents().expect("store is consistent");
+```
+
+The crate also provides:
+
+- `split_and_store` / `split_and_store_multi` — split a string on one or more delimiters and intern each part.
+- `store_path` — normalize a filesystem path and intern each segment.
+- `reconstruct` — rebuild the original string from a slice of indices.
+- `StoredStr<'a>` — a safe handle that derefs to `&str`.
+- `StoredStrPtr` — a raw-pointer handle for callers who can guarantee the store outlives the pointer.
 
 ## Installation
-
-Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
 stringstore = { git = "https://github.com/Ukko-Ylijumala/stringstore-rs" }
 ```
 
-## Usage
-```rust
-use stringstore::UniqueStrStore;
+The crate pulls in a few git-pinned dependencies under the same author (`custom_xxh3`, `miniutils`, `timesince`, and a fork of `size-of`). They are required for the crate to build.
 
-let hello: &'static str = "Hello, world!";
-let store = UniqueStrStore::new();
-assert_eq!(store.len(), 256); // incl. ISO-8859-1 codepoints by default
+## Features
 
-let hello_id = store.insert(hello);
-assert_eq!(store.len(), 256 + 1);
-assert!(store.contains(hello));
-assert_eq!(hello_id, 256, "hello string should be stored at index 256");
+- `size_of` *(off by default)* — implements `size_of::SizeOf` for `UniqueStrStore`, allowing memory footprint accounting. Requires the forked `size-of` git dependency.
 
-// try to insert the same string again
-let hello_id2 = store.insert(hello);
-assert_eq!(hello_id, hello_id2);
-assert_eq!(store.get(hello_id).unwrap(), hello);
+## Design
 
-let foo_id = store.insert("foo");
-assert_eq!(store.len(), 256 + 2);
-assert_eq!(foo_id, 257, "foo string should be stored at index 257");
+See [`doc/design/`](doc/design/README.md) for per-feature design notes — storage layout, concurrency model, unsafe pointer contract, tokenization, and the splitting/path encoding. These are the documents to read before contributing.
 
-// panics if the index is out of bounds
-assert_eq!(unsafe { store.borrow_str(foo_id) }, "foo");
+## Limitations
 
-// check internal consistency
-store.validate_contents().expect("Store validation failed");
-```
+- No string removal or modification (this is what makes the index stability and unsafe pointer surface sound — see [`doc/design/unsafe-pointers.md`](doc/design/unsafe-pointers.md)).
+- No partial deduplication; substrings of stored strings are not themselves shared.
+- Maximum unique strings: `u32::MAX - 255`. `insert` panics on overflow rather than returning a `StoreFull` error (the public signature returns `u32`; a future `try_insert -> Result<u32>` could surface this cleanly).
+- The two tokenizers used by `split_and_store_multi` can disagree on inputs with overlapping delimiters. See [`doc/design/tokenization.md`](doc/design/tokenization.md).
 
 ## License
 
-Copyright (c) 2024-2025 Mikko Tanner. All rights reserved.
-
-License: MIT OR Apache-2.0
+Copyright (c) 2024-2025 Mikko Tanner. Licensed under MIT OR Apache-2.0.
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request.
-
-## Version History
-
-- 0.3.5: Initial library version
-    - Filter StringStore code to a separate crate
-
-This library started its life as a component of a larger application, but at some point it made more sense to separate the code into its own little project and here we are.
+Issues and pull requests are welcome. Because the project is WIP, please open an issue to discuss any non-trivial change before sending a patch — internal layout is still in flux.
