@@ -1135,10 +1135,12 @@ pub fn tokenize(s: &str, delims: &[&str]) -> Vec<Token> {
     let mut i: usize = 0;
 
     while i < s.len() {
+        // Skip empty delimiters: starts_with("") is always true and would
+        // otherwise advance the cursor by zero, hanging the loop.
         if let Some((d_idx, delimiter)) = delims
             .iter()
             .enumerate()
-            .find(|(_, &d)| s[i..].starts_with(d))
+            .find(|(_, &d)| !d.is_empty() && s[i..].starts_with(d))
         {
             if !current_token.is_empty() {
                 tokens.push(Token {
@@ -1178,7 +1180,23 @@ In contrast to `tokenize()`, this version compiles a regex to find the
 delimiters, which should be faster for larger strings and more delimiters.
 */
 pub fn tokenize_regex(s: &str, delims: &[&str]) -> Vec<Token> {
-    let pattern: String = delims
+    // Skip empty delimiters: an empty alternative in the regex would match
+    // zero-width and emit garbage tokens at every position.
+    let non_empty: Vec<&str> = delims.iter().copied().filter(|d| !d.is_empty()).collect();
+
+    if non_empty.is_empty() {
+        // No usable delimiters: emit the input as a single non-delim token,
+        // or nothing if the input itself is empty.
+        if s.is_empty() {
+            return Vec::new();
+        }
+        return vec![Token {
+            content: s.to_string(),
+            ..Default::default()
+        }];
+    }
+
+    let pattern: String = non_empty
         .iter()
         .map(|p: &&str| escape(*p))
         .collect::<Vec<_>>()
@@ -1411,6 +1429,51 @@ mod tests {
             assert_eq!(tokens.len(), 24, "regex len failed, tokens:\n{tokens:#?}");
             assert!(tokens == t, "regex tokens don't match expected:\n{tokens:#?}");
 
+    }
+
+    #[test]
+    fn test_tokenize_empty_delim() {
+        // An empty delimiter must be skipped rather than hanging the loop.
+        let delims: [&str; 3] = [",", "", " "];
+        let tokens: Vec<Token> = tokenize("a, b", &delims);
+
+        assert_eq!(tokens.len(), 4, "tokens: {tokens:#?}");
+        assert_eq!(tokens[0].content, "a");
+        assert_eq!(tokens[1].content, ",");
+        assert_eq!(tokens[1].delim_idx, Some(0));
+        assert_eq!(tokens[2].content, " ");
+        assert_eq!(tokens[2].delim_idx, Some(2));
+        assert_eq!(tokens[3].content, "b");
+    }
+
+    #[test]
+    fn test_tokenize_regex_empty_delim() {
+        let delims: [&str; 3] = [",", "", " "];
+        let tokens: Vec<Token> = tokenize_regex("a, b", &delims);
+
+        assert_eq!(tokens.len(), 4, "tokens: {tokens:#?}");
+        assert_eq!(tokens[0].content, "a");
+        assert_eq!(tokens[1].content, ",");
+        assert_eq!(tokens[1].delim_idx, Some(0));
+        assert_eq!(tokens[2].content, " ");
+        assert_eq!(tokens[2].delim_idx, Some(2));
+        assert_eq!(tokens[3].content, "b");
+    }
+
+    #[test]
+    fn test_tokenize_all_empty_delims() {
+        // When every delimiter is empty (or there are none), the input passes
+        // through as a single non-delim token.
+        let delims: [&str; 2] = ["", ""];
+        let tokens: Vec<Token> = tokenize("hello", &delims);
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].content, "hello");
+        assert!(!tokens[0].is_delim);
+
+        let tokens: Vec<Token> = tokenize_regex("hello", &delims);
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].content, "hello");
+        assert!(!tokens[0].is_delim);
     }
 
     #[test]
