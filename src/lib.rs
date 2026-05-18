@@ -238,8 +238,8 @@ impl UniqueStrStore {
     */
     #[inline]
     pub unsafe fn borrow_str<'a>(&'a self, idx: u32) -> &'a str {
-        if idx > LATIN1_NUM && (idx - LATIN1_NUM) as usize >= self.store.read().len() {
-            panic!("Store index {idx} out of bounds (max: {})", self.len());
+        if idx >= LATIN1_NUM && (idx - LATIN1_NUM) as usize >= self.store.read().len() {
+            panic!("Store index {idx} out of bounds (max: {})", self.len() - 1);
         } else {
             let ptr: *const str = self.get_str_ptr(idx);
             &*ptr
@@ -1437,6 +1437,18 @@ mod tests {
         let ptr: StoredStrPtr = stored.as_ptr();
         assert!(!ptr.is_null(), "StoredStrPtr should not be null: {ptr:?}");
         assert_eq!(ptr.as_str(), HELLO, "Pointer string should be '{HELLO}': {ptr:?}");
+    }
+
+    #[test]
+    #[should_panic(expected = "out of bounds")]
+    fn test_borrow_str_oob_at_latin1_boundary() {
+        // idx == LATIN1_NUM (256) with an empty user-string store used to be
+        // undefined behavior because the bounds check used `>` instead of `>=`.
+        // Must now panic.
+        let store: UniqueStrStore = UniqueStrStore::new();
+        unsafe {
+            let _ = store.borrow_str(LATIN1_NUM);
+        }
     }
 
     #[test]
