@@ -1,0 +1,78 @@
+# Concurrency model
+
+`UniqueStrStore` is thread-safe and cheap to `Clone` (all backing state is in `Arc`s). The interesting decisions are in the **insert path** and in **how reads escape the lock**. This doc focuses on inserts; see `unsafe-pointers.md` for the read-side soundness story.
+
+## Locking primitives
+
+- `store`: `parking_lot::RwLock<Vec<Box<str>>>` — writers exclusive, readers shared.
+- `index`: `dashmap::DashMap<u64, u32, CustomXxh3Hasher>` — internally sharded, lock-free for non-conflicting keys.
+- `len`: `crossbeam::atomic::AtomicCell<u32>` — atomic public length counter.
+- `ascii`: no synchronization — built once at construction, never mutated.
+
+The `RwLock` and `DashMap` are independent locks. The invariant they jointly uphold (every entry in `index` points to a valid slot in `store` with a matching hash) is preserved by the **lock ordering and post-lock recheck** described below.
+
+## The fast path: read-only `idx()` / `contains()`
+
+For non-ASCII content the read path is:
+
+```text
+hash_bytes(s) ── DashMap::get ──► Option<u32 internal index>
+```
+
+No `RwLock` involvement at all. The DashMap value alone is sufficient — we do not need to dereference into `store` to answer "does this string exist?" or "what is its index?".
+
+This is also what makes `contains` and `idx` close to free under contention: a write lock on `store` does not stall them.
+
+## The insert path
+
+```text
+                       ┌─── empty? ──► return 0
+        insert(s) ─────┼─── single ASCII? ──► return codepoint index
+                       │
+                       └─── idx(&s).is_some()? ──► return existing index   (fast path, no write lock)
+                                  │
+                                  └── insert_unchecked(s):
+                                        1. take store write lock
+                                        2. compute key = hash_bytes(s)
+                                        3. idx = store.len() as u32        // tentative internal index
+                                        4. indexed = *index.entry(key).or_insert(idx)
+                                        5. if indexed == idx:
+                                              store.push(s.into())
+                                              len.fetch_add(1)
+                                        6. return indexed + LATIN1_NUM
+```
+
+### Why the recheck after taking the write lock
+
+Step 4 is the atomic decision point — **not** the earlier `idx()` call in the public `insert`. Between the `idx()` lookup and acquiring the write lock, another thread can win the race and insert the same string. The DashMap `entry().or_insert(idx)` resolves this: only the thread whose `idx` was actually inserted into the map is permitted to push into `store`.
+
+If a refactor moves the `idx()` check inside the write-lock region, the recheck still has to remain — two threads can both pass the `idx()` check before *either* takes the write lock.
+
+### Why the write lock is taken before consulting the DashMap
+
+Acquiring the `RwLock` write lock first guarantees that the `idx = store.len()` reservation cannot be invalidated by a concurrent `store.push`. If we touched the DashMap first, a different thread could push into `store` between our `len()` snapshot and our own push, corrupting the index-to-slot mapping.
+
+Concretely: the lock pins `store.len()` for the entire critical section, so `idx` is both the tentative DashMap value *and* the actual slot the push will land in.
+
+## What survives if the inserting thread loses the race
+
+The losing thread:
+
+- Allocated a `String` (in the public `insert<T: Into<String>>` wrapper).
+- Did not call `store.push`.
+- Did not call `len.fetch_add`.
+- Returns the *winner's* index.
+
+The local `String` is dropped at scope exit. No `Box<str>` is allocated on the losing path — the allocation only happens inside `store.push(s.into())`.
+
+## `validate_contents` takes a write lock
+
+`validate_contents` acquires `store.write()`, not `store.read()`. This is intentional: it freezes both `store.len()` and the DashMap snapshot it iterates so they are consistent. Calling `validate_contents` from one thread while another is hammering `insert` will serialize against the writer.
+
+In **debug builds** the function panics with the error list on any inconsistency; in release it returns `Err(Vec<String>)`. The concurrent-insert tests (`test_concurrent_inserts`, `test_competing_inserts`) call it as a `.ok()`-style assertion to rely on the debug-mode panic.
+
+## What you must not do
+
+- **Do not** call `insert` while holding the `store` write lock externally — there is no external way to take that lock, and any future API that exposed one would deadlock against `insert_unchecked`.
+- **Do not** reorder the steps in `insert_unchecked` so that `store.push` runs before the DashMap `entry` resolves. The `idx == store.len()` invariant relies on the push happening exactly when (and only when) the DashMap entry is fresh.
+- **Do not** add a path that increments `len` without pushing, or pushes without incrementing `len`. The `validate_contents` check `store.len() + LATIN1_NUM == len()` catches this, but only after the fact.

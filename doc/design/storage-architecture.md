@@ -1,0 +1,49 @@
+# Storage architecture
+
+`UniqueStrStore` is not one container — it is three, glued together by a single index space that hides the seam from callers. Understanding the seam is the prerequisite for touching almost anything else in `src/lib.rs`.
+
+## The three backing containers
+
+```text
+public index space:    0 ─────────────── 255 │ 256 ────────────── u32::MAX
+                       └── ascii Vec ───┘    │ └── store Vec (offset by 256) ──┘
+                       (fixed, no lock)      │ (Arc<RwLock<Vec<Box<str>>>>)
+
+content lookup:        index: Arc<DashMap<u64 xxh3 hash, u32 internal index>>
+length:                len: Arc<AtomicCell<u32>>  // public length, starts at 256
+```
+
+1. **`ascii: Arc<Vec<Box<str>>>`** — a fixed 256-entry vector populated once at construction with every ISO-8859-1 codepoint as a one-character `Box<str>`. The empty string `""` replaces `'\0'` at index 0. Read access skips both the `RwLock` and the hash map entirely.
+2. **`store: Arc<RwLock<Vec<Box<str>>>>`** — the actual interned strings. Internally indexed `0..N`, but every public-facing index is offset by `LATIN1_NUM` (256).
+3. **`index: Arc<DashMap<u64, u32, CustomXxh3Hasher>>`** — content-to-position lookup, keyed by the xxh3 hash of the bytes. The stored value is the *internal* `store` index (pre-offset).
+
+`len` is an `AtomicCell<u32>` that holds the authoritative public length. It starts at 256 (the ASCII range is always "present"), and is incremented under the write lock in `insert_unchecked` only after a successful new insertion.
+
+## The LATIN1_NUM offset
+
+The constant `LATIN1_NUM = 256` is load-bearing. Any code touching indices must know which space it is in:
+
+| Space | Range | Where it appears |
+|---|---|---|
+| Public (offset applied) | `0..len()` | All `pub` method args and returns, `idx()`, `get()`, `borrow_str(idx)`, `StoredStr.0`, etc. |
+| Internal `store` | `0..store.len()` | DashMap values, the `idx` variable inside `insert_unchecked`, direct `store[i]` access in `reconstruct`. |
+
+Translation points to watch:
+
+- `idx()`: returns `self.index.get(...).map(|r| r.value() + LATIN1_NUM)` — DashMap value is internal, add the offset for the public answer.
+- `get_str_ptr(idx)`: branches on `idx < LATIN1_NUM`. If yes, hit `ascii[idx]` directly. If no, take the read lock and index into `store[idx - LATIN1_NUM]`.
+- `insert_unchecked`: `let idx: u32 = store.len() as u32;` is internal; the return value is `indexed + LATIN1_NUM`.
+- `reconstruct`: same branch as `get_str_ptr` when fetching each part.
+
+## Why the split exists
+
+The motivation is twofold:
+
+1. **Hash/lock avoidance for the common case.** Single-character ISO-8859-1 strings are extremely common in tokenized output (whitespace, punctuation, digits). Routing them through `xxh3 → DashMap → RwLock` would dominate the cost of trivial inserts; the `ascii` short-circuit collapses these to a direct array index.
+2. **Stable "well-known" indices.** Callers can assume `0` is always the empty string and `1..256` are the ISO-8859-1 codepoints, regardless of insertion order, without ever calling `insert`. This makes index 0 usable as a sentinel (see `splitting-and-paths.md`).
+
+## Index lifetime guarantee
+
+Once a string is inserted, its public index is permanent. There is no removal, shrink, or compaction API — by design. This is what makes the unsafe pointer surface sound; see `unsafe-pointers.md`.
+
+The maximum number of *user-inserted* unique strings is `u32::MAX - LATIN1_NUM + 1`. `insert_unchecked` panics if `store.len()` reaches that ceiling before mutating any state. The `StoreFull` variant of `StringStoreError` exists for a future `try_insert -> Result<u32>` API but is not currently emitted — the public `insert` returns `u32` and so panics on overflow.
