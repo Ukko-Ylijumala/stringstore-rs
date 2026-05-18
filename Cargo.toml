@@ -38,3 +38,9 @@ git = "https://github.com/Ukko-Ylijumala/timesince-rs"
 
 [dependencies.miniutils]
 git = "https://github.com/Ukko-Ylijumala/miniutils-rs"
+
+# Redirect any transitive crates.io `size-of` reference (e.g. from
+# `custom_xxh3` with its `size_of` feature) to the fork that compiles on
+# Rust 1.89+ (works around E0570 in the upstream macro).
+[patch.crates-io]
+size-of = { git = "https://github.com/Ukko-Ylijumala/size-of" }
