@@ -666,10 +666,6 @@ impl StoredStrPtr {
     pub fn as_str(&self) -> &str {
         unsafe { &*self.0 }
     }
-
-    pub fn to_string(&self) -> String {
-        unsafe { &*self.0 }.to_string()
-    }
 }
 
 /* --------------------------------- */
