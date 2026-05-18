@@ -1,6 +1,6 @@
 [package]
 name = "stringstore"
-version = "0.3.5"
+version = "0.3.7"
 authors = ["Mikko Tanner <mikko.tanner@gmail.com>"]
 description = "String interning library for Rust"
 repository = "https://github.com/Ukko-Ylijumala/stringstore-rs"
