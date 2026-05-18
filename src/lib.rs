@@ -267,9 +267,21 @@ impl UniqueStrStore {
     */
     fn insert_unchecked(&self, s: String) -> u32 {
         let mut store = self.store.write();
+        let len: usize = store.len();
+
+        // Refuse inserts that would overflow the u32 public index space.
+        // Public index = internal index + LATIN1_NUM, so the maximum number
+        // of user-inserted strings is u32::MAX - LATIN1_NUM + 1.
+        if len >= (u32::MAX - LATIN1_NUM + 1) as usize {
+            panic!(
+                "UniqueStrStore is full: cannot insert beyond u32::MAX unique strings \
+                 ({len} user strings already stored)"
+            );
+        }
+
         let key: u64 = hash_bytes(s.as_bytes());
         // next free index
-        let idx: u32 = store.len() as u32;
+        let idx: u32 = len as u32;
 
         // atomic get or insert
         let indexed: u32 = *self.index.entry(key).or_insert(idx);
