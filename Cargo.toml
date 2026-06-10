@@ -16,7 +16,6 @@ edition = "2021"
 size_of = ["dep:size-of"]
 
 [dependencies]
-crossbeam = "0.8"
 parking_lot = "0.12"
 regex = "1.10"
 #size-of = { version = "0.1", optional = true }

@@ -10,14 +10,14 @@ public index space:    0 ─────────────── 255 │ 2
                        (fixed, no lock)      │ (Arc<RwLock<Vec<Box<str>>>>)
 
 content lookup:        index: Arc<DashMap<u64 xxh3 hash, u32 internal index>>
-length:                len: Arc<AtomicCell<u32>>  // public length, starts at 256
+length:                len: Arc<AtomicU32>  // public length, starts at 256
 ```
 
 1. **`ascii: Arc<Vec<Box<str>>>`** — a fixed 256-entry vector populated once at construction with every ISO-8859-1 codepoint as a one-character `Box<str>`. The empty string `""` replaces `'\0'` at index 0. Read access skips both the `RwLock` and the hash map entirely.
 2. **`store: Arc<RwLock<Vec<Box<str>>>>`** — the actual interned strings. Internally indexed `0..N`, but every public-facing index is offset by `LATIN1_NUM` (256).
 3. **`index: Arc<DashMap<u64, u32, CustomXxh3Hasher>>`** — content-to-position lookup, keyed by the xxh3 hash of the bytes. The stored value is the *internal* `store` index (pre-offset).
 
-`len` is an `AtomicCell<u32>` that holds the authoritative public length. It starts at 256 (the ASCII range is always "present"), and is incremented under the write lock in `insert_unchecked` only after a successful new insertion.
+`len` is a `std::sync::atomic::AtomicU32` that holds the authoritative public length. It starts at 256 (the ASCII range is always "present"), and is incremented under the write lock in `insert_unchecked` only after a successful new insertion. The increment uses `Release` ordering and `len()` loads with `Acquire`, so observing the new length implies the corresponding push is visible.
 
 ## The LATIN1_NUM offset
 
@@ -57,4 +57,4 @@ Cost of the insert-side check: every duplicate `insert` now takes the store read
 
 Once a string is inserted, its public index is permanent. There is no removal, shrink, or compaction API — by design. This is what makes the unsafe pointer surface sound; see `unsafe-pointers.md`.
 
-The maximum number of *user-inserted* unique strings is `u32::MAX - LATIN1_NUM + 1`. `insert_unchecked` panics if `store.len()` reaches that ceiling before mutating any state. The `StoreFull` variant of `StringStoreError` exists for a future `try_insert -> Result<u32>` API but is not currently emitted — the public `insert` returns `u32` and so panics on overflow.
+The maximum number of *user-inserted* unique strings is `u32::MAX - LATIN1_NUM + 1`. `insert_unchecked` returns `Err(StoreFull)` if `store.len()` reaches that ceiling, before mutating any state. `try_insert` surfaces that error to the caller; the public `insert` returns a bare `u32` and so panics on it. (A hash collision panics on *both* paths — it is unrepresentable, not recoverable; see the collision policy above.)

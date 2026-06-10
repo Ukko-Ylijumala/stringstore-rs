@@ -6,7 +6,7 @@
 
 - `store`: `parking_lot::RwLock<Vec<Box<str>>>` — writers exclusive, readers shared.
 - `index`: `dashmap::DashMap<u64, u32, CustomXxh3Hasher>` — internally sharded, lock-free for non-conflicting keys.
-- `len`: `crossbeam::atomic::AtomicCell<u32>` — atomic public length counter.
+- `len`: `std::sync::atomic::AtomicU32` — atomic public length counter. Incremented with `Release` (under the write lock, after the push); `len()` loads with `Acquire`, so a reader that observes the new length is guaranteed to see the pushed element.
 - `ascii`: no synchronization — built once at construction, never mutated.
 
 The `RwLock` and `DashMap` are independent locks. The invariant they jointly uphold (every entry in `index` points to a valid slot in `store` with a matching hash) is preserved by the **lock ordering and post-lock recheck** described below.
@@ -48,7 +48,9 @@ This is also what makes `contains` and `idx` close to free under contention: a w
                                       5. return indexed + LATIN1_NUM
 ```
 
-The hash is computed once, in the public `insert`, and passed into `insert_unchecked`.
+The hash is computed once (in `insert_internal`, shared by `insert` and `try_insert`) and passed into `insert_unchecked`. `try_insert` is the identical flow with one difference: a full store surfaces as `Err(StoreFull)` instead of a panic.
+
+The whole path borrows: `insert<T: AsRef<str>>` never copies the input string. The single allocation is the `Box<str>` created inside `store.push(s.into())` — and only on the thread that actually inserts. The already-interned case (the hot path) allocates nothing.
 
 ### Why the recheck after taking the write lock
 
@@ -72,13 +74,13 @@ Concretely: the lock pins `store.len()` for the entire critical section, so `idx
 
 The losing thread:
 
-- Allocated a `String` (in the public `insert<T: Into<String>>` wrapper).
+- Allocated nothing (`insert<T: AsRef<str>>` only borrows the input).
 - Did not call `store.push`.
 - Did not call `len.fetch_add`.
 - Compared its string against the winner's (collision check; panics on mismatch).
 - Returns the *winner's* index.
 
-The local `String` is dropped at scope exit. No `Box<str>` is allocated on the losing path — the allocation only happens inside `store.push(s.into())`.
+No `Box<str>` is allocated on the losing path — the only allocation on the entire insert path happens inside the winner's `store.push(s.into())`.
 
 ## Transient `idx()`/`get()` disagreement during insert
 

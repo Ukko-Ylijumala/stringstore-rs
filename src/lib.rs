@@ -2,7 +2,6 @@
 
 #![allow(dead_code)]
 
-use crossbeam::atomic::AtomicCell;
 use custom_xxh3::{hash_bytes, CustomXxh3Hasher};
 use dashmap::DashMap;
 use miniutils::normalize_path;
@@ -18,7 +17,10 @@ use std::{
     ops::Deref,
     path::{Path, PathBuf},
     str::{FromStr, Split},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU32, Ordering as AtomicOrdering},
+        Arc,
+    },
 };
 use timesince::SecondsSinceEpoch;
 //use uuid::Uuid;
@@ -109,7 +111,7 @@ pub struct UniqueStrStore {
     store: Arc<RwLock<Vec<Box<str>>>>,
     index: Arc<DashMap<u64, u32, CustomXxh3Hasher>>,
     ascii: Arc<Vec<Box<str>>>,
-    len: Arc<AtomicCell<u32>>,
+    len: Arc<AtomicU32>,
 }
 
 // The derived `Default` would bypass `new()` and produce a store with an
@@ -149,7 +151,7 @@ impl UniqueStrStore {
             )
             .into(),
             ascii: latin1.into(),
-            len: AtomicCell::new(LATIN1_NUM).into(),
+            len: AtomicU32::new(LATIN1_NUM).into(),
         }
     }
 
@@ -159,9 +161,12 @@ impl UniqueStrStore {
     }
 
     /// The number of unique string slices. Includes the ISO-8859-1 codepoints.
+    ///
+    /// Acquire pairs with the Release increment in `insert_unchecked`:
+    /// observing the new length implies the corresponding push is visible.
     #[inline]
     pub fn len(&self) -> usize {
-        self.len.load() as usize
+        self.len.load(AtomicOrdering::Acquire) as usize
     }
 
     /// Whether we already have this string slice stored.
@@ -284,7 +289,7 @@ impl UniqueStrStore {
     We still must check again after acquiring the write locks, as another
     thread might have gone behind our back in the meantime.
     */
-    fn insert_unchecked(&self, s: String, key: u64) -> u32 {
+    fn insert_unchecked(&self, s: &str, key: u64) -> StringStoreResult<u32> {
         let mut store = self.store.write();
         let len: usize = store.len();
 
@@ -292,10 +297,7 @@ impl UniqueStrStore {
         // Public index = internal index + LATIN1_NUM, so the maximum number
         // of user-inserted strings is u32::MAX - LATIN1_NUM + 1.
         if len >= (u32::MAX - LATIN1_NUM + 1) as usize {
-            panic!(
-                "UniqueStrStore is full: cannot insert beyond u32::MAX unique strings \
-                 ({len} user strings already stored)"
-            );
+            return Err(StringStoreError::StoreFull);
         }
 
         // next free index
@@ -304,41 +306,31 @@ impl UniqueStrStore {
         // atomic get or insert
         let indexed: u32 = *self.index.entry(key).or_insert(idx);
         if indexed == idx {
-            // we did in fact insert a new string
+            // we did in fact insert a new string; this `Box<str>` is the
+            // only allocation on the entire insert path
             store.push(s.into());
-            self.len.fetch_add(1);
+            self.len.fetch_add(1, AtomicOrdering::Release);
         } else {
             // someone else interned this hash first: make sure it is
             // actually the same string and not a 64-bit hash collision
             let stored: &str = &store[indexed as usize];
             if stored != s {
-                collision_panic(stored, &s, indexed);
+                collision_panic(stored, s, indexed);
             }
         }
-        indexed + LATIN1_NUM
+        Ok(indexed + LATIN1_NUM)
     }
 
-    /**
-    Insert a new string (slice), if it doesn't already exist.
-    Returns the index in either case.
-
-    On a hash hit the existing string's contents are compared against `s`;
-    a mismatch means a genuine 64-bit xxh3 collision, which the hash-keyed
-    index cannot represent, and results in a panic. See
-    `doc/design/storage-architecture.md` for the collision policy.
-    */
-    pub fn insert<T>(&self, s: T) -> u32
-    where
-        T: Into<String>,
-    {
-        let s: String = s.into();
+    /// Core insert logic shared by `insert` and `try_insert`. Borrows only —
+    /// the already-interned case (the hot path) allocates nothing.
+    fn insert_internal(&self, s: &str) -> StringStoreResult<u32> {
         if s.is_empty() {
-            return 0;
+            return Ok(0);
         }
 
         if s.len() <= 2 {
-            if let Some(c) = return_iso8859_1_cp(&s) {
-                return c; // ISO-8859-1 code point
+            if let Some(c) = return_iso8859_1_cp(s) {
+                return Ok(c); // ISO-8859-1 code point
             }
         }
 
@@ -355,25 +347,62 @@ impl UniqueStrStore {
             let store = self.store.read();
             let stored: &str = &store[internal as usize];
             if stored != s {
-                collision_panic(stored, &s, internal);
+                collision_panic(stored, s, internal);
             }
-            return internal + LATIN1_NUM;
+            return Ok(internal + LATIN1_NUM);
         }
         self.insert_unchecked(s, key)
     }
 
-    /// The reference of a stored string slice, if it exists.
+    /**
+    Insert a new string (slice), if it doesn't already exist.
+    Returns the index in either case.
+
+    On a hash hit the existing string's contents are compared against `s`;
+    a mismatch means a genuine 64-bit xxh3 collision, which the hash-keyed
+    index cannot represent, and results in a panic. See
+    `doc/design/storage-architecture.md` for the collision policy.
+
+    Panics when the store is full (the u32 index space is exhausted) —
+    use `try_insert` for a `Result`-returning alternative.
+    */
+    pub fn insert<T>(&self, s: T) -> u32
+    where
+        T: AsRef<str>,
+    {
+        match self.insert_internal(s.as_ref()) {
+            Ok(idx) => idx,
+            Err(e) => panic!("UniqueStrStore::insert failed: {e}"),
+        }
+    }
+
+    /**
+    Like `insert`, but returns [StringStoreError::StoreFull] instead of
+    panicking when the u32 index space is exhausted.
+
+    NOTE: a genuine 64-bit hash collision still panics — it signals that
+    the store cannot represent the string at all, which no caller can
+    meaningfully recover from. See `doc/design/storage-architecture.md`.
+    */
+    pub fn try_insert<T>(&self, s: T) -> StringStoreResult<u32>
+    where
+        T: AsRef<str>,
+    {
+        self.insert_internal(s.as_ref())
+    }
+
+    /// The [StoredStr] reference of a stored string slice, if it exists.
     #[inline]
-    fn get_ref(&'_ self, s: &str) -> Option<StoredStr<'_>> {
+    pub fn get_ref(&'_ self, s: &str) -> Option<StoredStr<'_>> {
         self.idx(s).map(|idx: u32| StoredStr(idx, self))
     }
 
     /// Insert a new string (slice) and return its [StoredStr] reference.
     ///
     /// If the string (slice) already exists, return its reference instead.
-    fn insert_or_get<T>(&'_ self, s: T) -> StoredStr<'_>
+    pub fn insert_or_get<T>(&'_ self, s: T) -> StoredStr<'_>
     where
-        T: Into<String>,
+        T: AsRef<str>,
     {
         // Delegating to `insert` gets us the collision check for free and
         // avoids the previous contains() -> insert_unchecked() -> get_ref()
@@ -1202,6 +1231,27 @@ pub struct Token {
     delim_idx: Option<usize>, // default: None
 }
 
+impl Token {
+    /// The text content of this token.
+    #[inline]
+    pub fn content(&self) -> &str {
+        &self.content
+    }
+
+    /// Whether this token matched one of the delimiters.
+    #[inline]
+    pub fn is_delim(&self) -> bool {
+        self.is_delim
+    }
+
+    /// The position of the matched delimiter in the original `delims` slice
+    /// (None for non-delimiter tokens).
+    #[inline]
+    pub fn delim_idx(&self) -> Option<usize> {
+        self.delim_idx
+    }
+}
+
 /**
 Tokenize a string by a set of delimiters and return a [Vec] of [Token]s.
 The delimiters are included as separate tokens.
@@ -1431,8 +1481,8 @@ impl StringStoreError {
 
 /* ################################ TESTS ################################## */
 
+#[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
     use super::*;
 
     const HELLO: &str = "Hello, world!";
@@ -1906,6 +1956,31 @@ mod tests {
             store.reconstruct(&parts3, store.idx(PATH_SEP).unwrap()).unwrap(),
             "input <-> reconstruct() mismatch (path3)"
         );
+    }
+
+    #[test]
+    fn test_try_insert() {
+        let store: UniqueStrStore = UniqueStrStore::new();
+        assert_eq!(store.try_insert(""), Ok(0));
+        assert_eq!(store.try_insert("a"), Ok('a' as u32));
+
+        let idx: u32 = store.try_insert(HELLO).unwrap();
+        assert_eq!(idx, LATIN1_NUM);
+        assert_eq!(store.try_insert(HELLO), Ok(idx), "duplicate should return same index");
+        assert_eq!(store.insert(HELLO), idx, "insert/try_insert must agree");
+        assert_eq!(store.len(), LATIN1_NUM as usize + 1);
+    }
+
+    #[test]
+    fn test_token_accessors() {
+        let tokens: Vec<Token> = tokenize("a,b", &[","]);
+        assert_eq!(tokens.len(), 3);
+        assert_eq!(tokens[0].content(), "a");
+        assert!(!tokens[0].is_delim());
+        assert_eq!(tokens[0].delim_idx(), None);
+        assert_eq!(tokens[1].content(), ",");
+        assert!(tokens[1].is_delim());
+        assert_eq!(tokens[1].delim_idx(), Some(0));
     }
 
     #[test]
