@@ -46,7 +46,7 @@ The motivation is twofold:
 
 The `index` DashMap is keyed by the 64-bit xxh3 hash of the string bytes — within the index, string identity *is* the hash. Two distinct strings colliding on the full 64 bits cannot both be represented (odds are ~n²/2⁶⁵; roughly 1 in 370k for a store holding 10M strings).
 
-The policy as of v0.3.8:
+The policy as of v0.3.9:
 
 - **`insert` verifies.** On a hash hit — both in the fast path and in the lost-race branch inside `insert_unchecked` — the stored string's contents are compared against the incoming string. A mismatch calls `collision_panic`: a deliberate panic, because silently returning the other string's index would corrupt every downstream index vector. There is no graceful recovery without re-keying the index (e.g. `DashMap<u64, SmallVec<u32>>`); revisit only if a collision is ever observed in the wild.
 - **`contains` and `idx` do not verify.** They remain pure hash lookups (no lock, no content fetch) to keep the read path free of `RwLock` involvement. Consequence: for a string that was *never inserted* but collides with a stored one, `contains` returns a false positive and `idx` returns the colliding string's index. Strings that went through `insert` are unaffected — the insert-time check guarantees no two *stored* strings share a hash.
