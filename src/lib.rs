@@ -132,12 +132,9 @@ impl UniqueStrStore {
         // Make the ISO-8859-1 codepoint Vec. Its first element
         // is always the empty string.
         let mut latin1: Vec<Box<str>> = (0..LATIN1_NUM)
-            .into_iter()
             .map(|i: u32| {
                 // this is safe because we stay in a safe range
-                unsafe { char::from_u32_unchecked(i as u32) }
-                    .to_string()
-                    .into()
+                unsafe { char::from_u32_unchecked(i) }.to_string().into()
             })
             .collect();
         // replace the null string ('\0') with an empty string
@@ -169,6 +166,13 @@ impl UniqueStrStore {
         self.len.load(AtomicOrdering::Acquire) as usize
     }
 
+    /// Always false: indices 0-255 (the ISO-8859-1 codepoints) are populated
+    /// at construction and nothing is ever removed.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        false
+    }
+
     /// Whether we already have this string slice stored.
     ///
     /// NOTE: this is a pure hash lookup (no content comparison, no locking),
@@ -177,7 +181,7 @@ impl UniqueStrStore {
     /// see `doc/design/storage-architecture.md` for the collision policy.
     #[inline]
     pub fn contains(&self, s: &str) -> bool {
-        if s.len() == 0 {
+        if s.is_empty() {
             return true; // empty string is always contained
         }
 
@@ -196,7 +200,7 @@ impl UniqueStrStore {
     /// collision with a stored string returns that string's index instead
     /// of `None`. `insert` is the verified path.
     pub fn idx(&self, s: &str) -> Option<u32> {
-        if s.len() == 0 {
+        if s.is_empty() {
             return Some(0);
         }
 
@@ -212,7 +216,7 @@ impl UniqueStrStore {
     }
 
     /// Get a reference to a stored string slice by its index, if it exists.
-    pub fn get<'a>(&'a self, idx: u32) -> StringStoreResult<&'a str> {
+    pub fn get(&self, idx: u32) -> StringStoreResult<&str> {
         let len: usize = self.len();
         if idx as usize >= len {
             return Err(StringStoreError::oob(idx, len - 1));
@@ -241,25 +245,26 @@ impl UniqueStrStore {
     std::str::from_utf8_unchecked(bytes)
     */
     #[inline]
-    unsafe fn get_str_ptr<'a>(&'a self, idx: u32) -> *const str {
+    unsafe fn get_str_ptr(&self, idx: u32) -> *const str {
         // ISO-8859-1 range
         if idx < LATIN1_NUM {
-            return self.ascii[idx as usize].as_ref() as *const str;
+            self.ascii[idx as usize].as_ref() as *const str
         } else {
             let store = self.store.read();
-            let b: &Box<str> = store.get_unchecked((idx - LATIN1_NUM) as usize);
-            b.as_ref() as *const str
+            store.get_unchecked((idx - LATIN1_NUM) as usize).as_ref() as *const str
         }
     }
 
     /**
     Borrow a raw reference to a stored [str]. For a safe alternative, use `get`.
 
-    ### Safety
-    Calling this method with an out-of-bounds index will panic.
+    # Safety
+    Calling this method with an out-of-bounds index will panic. The returned
+    reference outlives the internal read lock; callers must uphold the
+    append-only contract (see `doc/design/unsafe-pointers.md`).
     */
     #[inline]
-    pub unsafe fn borrow_str<'a>(&'a self, idx: u32) -> &'a str {
+    pub unsafe fn borrow_str(&self, idx: u32) -> &str {
         if idx >= LATIN1_NUM && (idx - LATIN1_NUM) as usize >= self.store.read().len() {
             panic!("Store index {idx} out of bounds (max: {})", self.len() - 1);
         } else {
@@ -274,8 +279,10 @@ impl UniqueStrStore {
     WARNING: THIS IS AN UNSAFE FN AND SHOULD BE USED WITH CAUTION.
     NO BOUNDS CHECKING IS PERFORMED
 
-    NOTE: The pointer is only valid as long as the store is alive, but this
-    is not enforced. The lifetime is the responsibility of the user.
+    # Safety
+    `idx` must be in bounds (`idx < self.len()`) — no bounds checking is
+    performed. The pointer is only valid as long as the store is alive, but
+    this is not enforced; the lifetime is the responsibility of the user.
     */
     pub unsafe fn get_ptr(&self, idx: u32) -> StoredStrPtr {
         StoredStrPtr(self.get_str_ptr(idx))
@@ -414,8 +421,8 @@ impl UniqueStrStore {
     /// Store the parts and return their indices.
     fn store_parts(&self, s: &str, delim: &str) -> Vec<u32> {
         let mut result: Vec<u32> = Vec::new();
-        let mut parts: Split<&str> = s.split(delim);
-        while let Some(part) = parts.next() {
+        let parts: Split<&str> = s.split(delim);
+        for part in parts {
             if part.is_empty() {
                 // empty string here means one of the following:
                 // - 2 contiguous delimiters
@@ -496,7 +503,7 @@ impl UniqueStrStore {
         let mut result: Vec<u32> = vec![];
         let mut delim_indices: Vec<u32> = vec![];
         // TODO: evaluate thresholds for switching between tokenizers
-        let regex: bool = force_regex.unwrap_or_else(|| complexity > 10000 || delims.len() > 10);
+        let regex: bool = force_regex.unwrap_or(complexity > 10000 || delims.len() > 10);
 
         if !delims.is_empty() {
             // store the delimiters first
@@ -596,7 +603,7 @@ impl UniqueStrStore {
         }
 
         // get the delimiter string
-        let delim_str: &Box<str> = match delim < LATIN1_NUM {
+        let delim_str: &str = match delim < LATIN1_NUM {
             true => &self.ascii[delim as usize],
             false => &store[(delim - LATIN1_NUM) as usize],
         };
@@ -673,7 +680,7 @@ impl UniqueStrStore {
             // safe lookup: an out-of-bounds index used to fall through to a
             // `get_unchecked` here, which is UB — exactly when validation
             // has found something worth reporting
-            let s: &Box<str> = match store.get(*sid as usize) {
+            let s: &str = match store.get(*sid as usize) {
                 Some(s) => s,
                 None => {
                     errs.push(format!("index out of bounds: {sid} >= {l_store} (hash: 0x{key:x})"));
@@ -767,13 +774,13 @@ impl Deref for StoredStrPtr {
 
 impl PartialOrd for StoredStrPtr {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        self.as_str().partial_cmp(&other.as_str())
+        Some(self.cmp(other))
     }
 }
 
 impl Ord for StoredStrPtr {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.as_str().cmp(&other.as_str())
+        self.as_str().cmp(other.as_str())
     }
 }
 
@@ -861,7 +868,7 @@ impl<'a> StoredStr<'a> {
 
     /// Get the reference to the [UniqueStrStore] that contains this string.
     pub fn store(&self) -> &UniqueStrStore {
-        &*self.1
+        self.1
     }
 
     pub fn cloned(&self) -> String {
@@ -897,13 +904,13 @@ impl<'a> PartialEq for StoredStr<'a> {
 
 impl<'a> PartialOrd for StoredStr<'a> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        self.reference().partial_cmp(&other.reference())
+        Some(self.cmp(other))
     }
 }
 
 impl<'a> Ord for StoredStr<'a> {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.reference().cmp(&other.reference())
+        self.reference().cmp(other.reference())
     }
 }
 
@@ -1105,7 +1112,7 @@ impl Hex {
         self.0
     }
 
-    fn to_string(&self, fmt: HexFormat) -> String {
+    fn to_string(self, fmt: HexFormat) -> String {
         // Order matters: the "0x" prefix must be applied last so that it is
         // neither uppercased ("0X...") nor counted into the column grouping.
         let mut result: String = format!("{:x}", self.0);
@@ -1172,10 +1179,13 @@ impl HexFormat {
         self.0 & Self::COLUMNS.0 != 0
     }
 
-    #[rustfmt::skip]
-    pub fn to_string(&self) -> String {
+}
+
+#[rustfmt::skip]
+impl Display for HexFormat {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         if *self == Self::PLAIN {
-            return "Plain".to_string();
+            return write!(f, "Plain");
         }
 
         let mut parts: Vec<&str> = Vec::new();
@@ -1184,15 +1194,15 @@ impl HexFormat {
         if self.is_columns() { parts.push("Columns"); }
         if parts.is_empty() {
             // non-zero but no known flag bits set
-            return format!("Unknown(0b{:b})", self.0);
+            return write!(f, "Unknown(0b{:b})", self.0);
         }
-        parts.join("|")
+        write!(f, "{}", parts.join("|"))
     }
 }
 
 impl Debug for HexFormat {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "HexFmt({}: {})", self.0, self.to_string())
+        write!(f, "HexFmt({}: {})", self.0, self)
     }
 }
 
@@ -1331,7 +1341,7 @@ pub fn tokenize_regex(s: &str, delims: &[&str]) -> Vec<Token> {
 
     let pattern: String = non_empty
         .iter()
-        .map(|p: &&str| escape(*p))
+        .map(|p: &&str| escape(p))
         .collect::<Vec<_>>()
         .join("|");
     let re: Regex = Regex::new(&pattern).unwrap();
@@ -1502,7 +1512,7 @@ mod tests {
 
         // Check that the length and tokenization is correct
         assert_eq!(tokens.len(), TOKENS_LEN, "len failed, tokens:\n{tokens:#?}");
-        for (i, &ref token) in tokens.iter().enumerate() {
+        for (i, token) in tokens.iter().enumerate() {
             let exp: &str = TOKENS_EXPECTED[i];
             assert_eq!(token.content, exp, "token {i}: {token:?} (tokens: {tokens:#?})");
         }
@@ -1514,7 +1524,7 @@ mod tests {
         let tokens: Vec<Token> = tokenize_regex(TOKEN_TEST, &TOKEN_DELIMS);
 
         assert_eq!(tokens.len(), TOKENS_LEN, "len failed, tokens:\n{tokens:#?}");
-        for (i, &ref token) in tokens.iter().enumerate() {
+        for (i, token) in tokens.iter().enumerate() {
             let exp: &str = TOKENS_EXPECTED[i];
             assert_eq!(token.content, exp, "token {i}: {token:?}, tokens:\n{tokens:#?})");
         }
@@ -1930,7 +1940,7 @@ mod tests {
         }
 
         assert_eq!(
-            exp_2.iter().map(|s| *s).collect::<Vec<&str>>().join(PATH_SEP),
+            exp_2.join(PATH_SEP),
             store.reconstruct(&parts2, store.idx(PATH_SEP).unwrap()).unwrap(),
             "input <-> reconstruct() mismatch (path2)"
         );
@@ -1952,7 +1962,7 @@ mod tests {
         }
 
         assert_eq!(
-            exp_3.iter().map(|s| *s).collect::<Vec<&str>>().join(PATH_SEP),
+            exp_3.join(PATH_SEP),
             store.reconstruct(&parts3, store.idx(PATH_SEP).unwrap()).unwrap(),
             "input <-> reconstruct() mismatch (path3)"
         );
