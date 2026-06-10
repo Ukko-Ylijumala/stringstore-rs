@@ -1,6 +1,4 @@
-// Copyright (c) 2024-2025 Mikko Tanner. All rights reserved.
-
-#![allow(dead_code)]
+// Copyright (c) 2024-2026 Mikko Tanner. All rights reserved.
 
 use custom_xxh3::{hash_bytes, CustomXxh3Hasher};
 use dashmap::DashMap;
@@ -157,10 +155,12 @@ impl UniqueStrStore {
         self.into()
     }
 
-    /// The number of unique string slices. Includes the ISO-8859-1 codepoints.
-    ///
-    /// Acquire pairs with the Release increment in `insert_unchecked`:
-    /// observing the new length implies the corresponding push is visible.
+    /**
+    The number of unique string slices. Includes the ISO-8859-1 codepoints.
+
+    Acquire pairs with the Release increment in `insert_unchecked`:
+    observing the new length implies the corresponding push is visible.
+    */
     #[inline]
     pub fn len(&self) -> usize {
         self.len.load(AtomicOrdering::Acquire) as usize
@@ -173,12 +173,14 @@ impl UniqueStrStore {
         false
     }
 
-    /// Whether we already have this string slice stored.
-    ///
-    /// NOTE: this is a pure hash lookup (no content comparison, no locking),
-    /// so a never-inserted string whose 64-bit xxh3 hash collides with a
-    /// stored one yields a false positive. `insert` does verify contents;
-    /// see `doc/design/storage-architecture.md` for the collision policy.
+    /**
+    Whether we already have this string slice stored.
+
+    NOTE: this is a pure hash lookup (no content comparison, no locking),
+    so a never-inserted string whose 64-bit xxh3 hash collides with a
+    stored one yields a false positive. `insert` does verify contents;
+    see `doc/design/storage-architecture.md` for the collision policy.
+    */
     #[inline]
     pub fn contains(&self, s: &str) -> bool {
         if s.is_empty() {
@@ -194,11 +196,13 @@ impl UniqueStrStore {
         self.index.contains_key(&hash_bytes(s.as_bytes()))
     }
 
-    /// Get the index of a stored string slice by its content, if it exists.
-    ///
-    /// NOTE: like `contains`, this is a pure hash lookup — a 64-bit xxh3
-    /// collision with a stored string returns that string's index instead
-    /// of `None`. `insert` is the verified path.
+    /**
+    Get the index of a stored string slice by its content, if it exists.
+
+    NOTE: like `contains`, this is a pure hash lookup — a 64-bit xxh3
+    collision with a stored string returns that string's index instead
+    of `None`. `insert` is the verified path.
+    */
     pub fn idx(&self, s: &str) -> Option<u32> {
         if s.is_empty() {
             return Some(0);
@@ -300,9 +304,11 @@ impl UniqueStrStore {
         let mut store = self.store.write();
         let len: usize = store.len();
 
-        // Refuse inserts that would overflow the u32 public index space.
-        // Public index = internal index + LATIN1_NUM, so the maximum number
-        // of user-inserted strings is u32::MAX - LATIN1_NUM + 1.
+        /*
+        Refuse inserts that would overflow the u32 public index space.
+        Public index = internal index + LATIN1_NUM, so the maximum number
+        of user-inserted strings is u32::MAX - LATIN1_NUM + 1.
+        */
         if len >= (u32::MAX - LATIN1_NUM + 1) as usize {
             return Err(StringStoreError::StoreFull);
         }
@@ -341,16 +347,20 @@ impl UniqueStrStore {
             }
         }
 
-        // For non-ASCII or multi-character strings. NOTE: copy the index
-        // out of the DashMap guard before touching the store lock — holding
-        // a shard guard while taking the store lock would invert the
-        // store -> index lock order used by `insert_unchecked`.
+        /*
+        For non-ASCII or multi-character strings. NOTE: copy the index
+        out of the DashMap guard before touching the store lock — holding
+        a shard guard while taking the store lock would invert the
+        store -> index lock order used by `insert_unchecked`.
+        */
         let key: u64 = hash_bytes(s.as_bytes());
         if let Some(internal) = self.index.get(&key).map(|r| *r.value()) {
-            // The slot is guaranteed to exist: the entry is only ever
-            // published inside the write-lock critical section that also
-            // pushes the string, so acquiring the read lock here means
-            // that section has completed.
+            /*
+            The slot is guaranteed to exist: the entry is only ever
+            published inside the write-lock critical section that also
+            pushes the string, so acquiring the read lock here means
+            that section has completed.
+            */
             let store = self.store.read();
             let stored: &str = &store[internal as usize];
             if stored != s {
@@ -404,17 +414,21 @@ impl UniqueStrStore {
         self.idx(s).map(|idx: u32| StoredStr(idx, self))
     }
 
-    /// Insert a new string (slice) and return its [StoredStr] reference.
-    ///
-    /// If the string (slice) already exists, return its reference instead.
+    /**
+    Insert a new string (slice) and return its [StoredStr] reference.
+
+    If the string (slice) already exists, return its reference instead.
+    */
     pub fn insert_or_get<T>(&'_ self, s: T) -> StoredStr<'_>
     where
         T: AsRef<str>,
     {
-        // Delegating to `insert` gets us the collision check for free and
-        // avoids the previous contains() -> insert_unchecked() -> get_ref()
-        // dance (which cloned the string and skipped verification when the
-        // hash was already present).
+        /*
+        Delegating to `insert` gets us the collision check for free and
+        avoids the previous contains() -> insert_unchecked() -> get_ref()
+        dance (which cloned the string and skipped verification when the
+        hash was already present).
+        */
         StoredStr(self.insert(s), self)
     }
 
@@ -968,6 +982,16 @@ impl<'a> From<StoredStr<'a>> for &'a str {
 
 /* ######################################################################### */
 
+/*
+NOTE: the dormant structured-text scaffolding below carries scoped
+`#[expect(dead_code)]` attributes instead of a crate-wide allow. The
+moment an item gets wired up, its attribute reports itself as an
+"unfulfilled lint expectation" — remove it then. The type definitions
+themselves need no attribute: rustc treats the `expect`-annotated impls
+and `TextElement` as live roots, which keeps the types they reference
+transitively live.
+*/
+
 /**
 A reference (index) to a stored string slice in a [UniqueStrStore].
 
@@ -977,6 +1001,7 @@ hence it is only usable as a part of a larger structure with a reference.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CompactStr(u32);
 
+#[expect(dead_code)]
 impl CompactStr {
     #[inline]
     fn idx(&self) -> u32 {
@@ -996,6 +1021,7 @@ impl CompactStr {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Character(CompactStr, u8);
 
+#[expect(dead_code)]
 impl Character {
     #[inline]
     fn idx(&self) -> u32 {
@@ -1019,6 +1045,7 @@ impl Character {
 /* --------------------------------- */
 
 /// Possible text elements in a structured line.
+#[expect(dead_code)]
 #[derive(Debug, PartialEq)]
 enum TextElement<I: Integer = i64> {
     /// An element which is explicitly a delimiter, f.ex. space (`" "`).
@@ -1072,12 +1099,14 @@ enum TextElement<I: Integer = i64> {
 
 /// A unit of structured text, which can be a line or a block.
 /// Contains a reference to the [UniqueStrStore] for string retrieval.
+#[expect(dead_code)]
 #[derive(Debug)]
 struct StructuredLine {
     elems: Vec<TextElement>,
     store: Arc<UniqueStrStore>,
 }
 
+#[expect(dead_code)]
 impl StructuredLine {
     fn new(store: &Arc<UniqueStrStore>) -> Self {
         Self {
@@ -1107,6 +1136,7 @@ impl PartialEq for StructuredLine {
 #[derive(Clone, Copy, PartialEq)]
 struct Hex(u64);
 
+#[expect(dead_code)]
 impl Hex {
     fn get(&self) -> u64 {
         self.0
@@ -1208,6 +1238,7 @@ impl Debug for HexFormat {
 
 /* --------------------------------- */
 
+#[expect(dead_code)]
 trait Integer: FromStr + Display + Debug + Copy + PartialOrd + Send + Sync + 'static {
     fn as_i64(&self) -> i64;
     fn as_u64(&self) -> u64;
@@ -1296,9 +1327,11 @@ pub fn tokenize(s: &str, delims: &[&str]) -> Vec<Token> {
 
             i += delimiter.len();
         } else {
-            // Advance by the full UTF-8 width of the char: advancing by one
-            // byte would put `i` inside a multibyte char and panic on the
-            // next `s[i..]` slice.
+            /*
+            Advance by the full UTF-8 width of the char: advancing by one
+            byte would put `i` inside a multibyte char and panic on the
+            next `s[i..]` slice.
+            */
             let c: char = s[i..].chars().next().unwrap();
             current_token.push(c);
             i += c.len_utf8();
@@ -1384,9 +1417,11 @@ pub fn tokenize_regex(s: &str, delims: &[&str]) -> Vec<Token> {
 
 /* ########################## UTILITY FUNCTIONS ############################ */
 
-/// A genuine 64-bit xxh3 collision between two distinct strings. The index
-/// is keyed by hash alone, so the store cannot represent both — and silently
-/// returning the other string's index would corrupt every downstream user.
+/**
+A genuine 64-bit xxh3 collision between two distinct strings. The index
+is keyed by hash alone, so the store cannot represent both — and silently
+returning the other string's index would corrupt every downstream user.
+*/
 #[cold]
 #[inline(never)]
 fn collision_panic(stored: &str, new: &str, internal: u32) -> ! {
@@ -1397,10 +1432,12 @@ fn collision_panic(stored: &str, new: &str, internal: u32) -> ! {
     );
 }
 
-/// Check whether a string consists of exactly one ISO-8859-1 codepoint,
-/// and if so, return it. Otherwise (incl. empty string), return None.
-/// Note: codepoints 128-255 are *two* bytes in UTF-8, so callers must not
-/// pre-filter on byte length == 1.
+/**
+Check whether a string consists of exactly one ISO-8859-1 codepoint,
+and if so, return it. Otherwise (incl. empty string), return None.
+Note: codepoints 128-255 are *two* bytes in UTF-8, so callers must not
+pre-filter on byte length == 1.
+*/
 #[inline]
 fn return_iso8859_1_cp(s: &str) -> Option<u32> {
     let mut chars = s.chars();
@@ -1663,9 +1700,11 @@ mod tests {
 
     #[test]
     fn test_latin1_two_byte_chars() {
-        // Codepoints 128-255 are 2 bytes in UTF-8. They used to bypass the
-        // ISO-8859-1 fast path (gated on byte length == 1) and get interned
-        // a second time at an index >= LATIN1_NUM.
+        /*
+        Codepoints 128-255 are 2 bytes in UTF-8. They used to bypass the
+        ISO-8859-1 fast path (gated on byte length == 1) and get interned
+        a second time at an index >= LATIN1_NUM.
+        */
         let store: UniqueStrStore = UniqueStrStore::new();
 
         for cp in 1..LATIN1_NUM {
@@ -1731,9 +1770,11 @@ mod tests {
     #[test]
     #[should_panic(expected = "out of bounds")]
     fn test_borrow_str_oob_at_latin1_boundary() {
-        // idx == LATIN1_NUM (256) with an empty user-string store used to be
-        // undefined behavior because the bounds check used `>` instead of `>=`.
-        // Must now panic.
+        /*
+        idx == LATIN1_NUM (256) with an empty user-string store used to be
+        undefined behavior because the bounds check used `>` instead of `>=`.
+        Must now panic.
+        */
         let store: UniqueStrStore = UniqueStrStore::new();
         unsafe {
             let _ = store.borrow_str(LATIN1_NUM);
