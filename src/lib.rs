@@ -104,12 +104,20 @@ assert_eq!(unsafe { store.borrow_str(foo_id) }, "foo");
 // check internal consistency
 store.validate_contents().expect("Store validation failed");
 */
-#[derive(Default, Debug, Clone)]
+#[derive(Debug, Clone)]
 pub struct UniqueStrStore {
     store: Arc<RwLock<Vec<Box<str>>>>,
     index: Arc<DashMap<u64, u32, CustomXxh3Hasher>>,
     ascii: Arc<Vec<Box<str>>>,
     len: Arc<AtomicCell<u32>>,
+}
+
+// The derived `Default` would bypass `new()` and produce a store with an
+// empty `ascii` table and `len == 0`, violating every invariant.
+impl Default for UniqueStrStore {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl UniqueStrStore {
@@ -163,10 +171,10 @@ impl UniqueStrStore {
             return true; // empty string is always contained
         }
 
-        if s.len() == 1 {
-            if return_iso8859_1_cp(s).is_some() {
-                return true; // ISO-8859-1 implicitly contained
-            }
+        // ISO-8859-1 codepoints are implicitly contained. NOTE: codepoints
+        // 128-255 are 2 bytes in UTF-8, hence the `<= 2` byte-length gate.
+        if s.len() <= 2 && return_iso8859_1_cp(s).is_some() {
+            return true;
         }
 
         self.index.contains_key(&hash_bytes(s.as_bytes()))
@@ -178,7 +186,7 @@ impl UniqueStrStore {
             return Some(0);
         }
 
-        if s.len() == 1 {
+        if s.len() <= 2 {
             if let Some(c) = return_iso8859_1_cp(s) {
                 return Some(c);
             }
@@ -304,7 +312,7 @@ impl UniqueStrStore {
             return 0;
         }
 
-        if s.len() == 1 {
+        if s.len() <= 2 {
             if let Some(c) = return_iso8859_1_cp(&s) {
                 return c; // ISO-8859-1 code point
             }
@@ -1165,8 +1173,12 @@ pub fn tokenize(s: &str, delims: &[&str]) -> Vec<Token> {
 
             i += delimiter.len();
         } else {
-            current_token.push(s[i..].chars().next().unwrap());
-            i += 1;
+            // Advance by the full UTF-8 width of the char: advancing by one
+            // byte would put `i` inside a multibyte char and panic on the
+            // next `s[i..]` slice.
+            let c: char = s[i..].chars().next().unwrap();
+            current_token.push(c);
+            i += c.len_utf8();
         }
     }
 
@@ -1249,12 +1261,15 @@ pub fn tokenize_regex(s: &str, delims: &[&str]) -> Vec<Token> {
 
 /* ########################## UTILITY FUNCTIONS ############################ */
 
-/// Check whether the first character of a string is an ISO-8859-1 codepoint,
-/// and if so, return it. Otherwise, return None. Zero-length string will panic.
+/// Check whether a string consists of exactly one ISO-8859-1 codepoint,
+/// and if so, return it. Otherwise (incl. empty string), return None.
+/// Note: codepoints 128-255 are *two* bytes in UTF-8, so callers must not
+/// pre-filter on byte length == 1.
 #[inline]
 fn return_iso8859_1_cp(s: &str) -> Option<u32> {
-    let c: u32 = s.chars().next().unwrap() as u32;
-    if c < LATIN1_NUM {
+    let mut chars = s.chars();
+    let c: u32 = chars.next()? as u32;
+    if c < LATIN1_NUM && chars.next().is_none() {
         return Some(c);
     }
     None
@@ -1482,6 +1497,73 @@ mod tests {
         assert_eq!(tokens.len(), 1);
         assert_eq!(tokens[0].content, "hello");
         assert!(!tokens[0].is_delim);
+    }
+
+    #[test]
+    fn test_tokenize_multibyte() {
+        // The linear tokenizer used to advance by one byte after pushing a
+        // full char, panicking on a mid-char slice for any non-ASCII input.
+        let input: &str = "héllo wörld,日本語";
+        let expected: [&str; 5] = ["héllo", " ", "wörld", ",", "日本語"];
+
+        let tokens: Vec<Token> = tokenize(input, &[" ", ","]);
+        assert_eq!(tokens.len(), expected.len(), "tokens: {tokens:#?}");
+        for (token, exp) in tokens.iter().zip(expected) {
+            assert_eq!(token.content, exp);
+        }
+
+        // Both tokenizers must agree on multibyte input.
+        let tokens_re: Vec<Token> = tokenize_regex(input, &[" ", ","]);
+        assert!(tokens == tokens_re, "tokenizers diverge:\n{tokens:#?}\nvs\n{tokens_re:#?}");
+
+        // Multibyte delimiters must work too.
+        let tokens: Vec<Token> = tokenize("a→b", &["→"]);
+        assert_eq!(tokens.len(), 3, "tokens: {tokens:#?}");
+        assert_eq!(tokens[0].content, "a");
+        assert_eq!(tokens[1].content, "→");
+        assert!(tokens[1].is_delim);
+        assert_eq!(tokens[2].content, "b");
+    }
+
+    #[test]
+    fn test_latin1_two_byte_chars() {
+        // Codepoints 128-255 are 2 bytes in UTF-8. They used to bypass the
+        // ISO-8859-1 fast path (gated on byte length == 1) and get interned
+        // a second time at an index >= LATIN1_NUM.
+        let store: UniqueStrStore = UniqueStrStore::new();
+
+        for cp in 1..LATIN1_NUM {
+            let s: String = char::from_u32(cp).unwrap().to_string();
+            assert!(store.contains(&s), "contains('{s}') should be true (cp {cp})");
+            assert_eq!(store.idx(&s), Some(cp), "idx('{s}') should be {cp}");
+            assert_eq!(store.insert(&s), cp, "insert('{s}') should return {cp}");
+        }
+        assert_eq!(store.len(), LATIN1_NUM as usize, "no duplicates should be stored");
+
+        // 2-char strings (same byte length as a 2-byte char) still intern normally.
+        let idx: u32 = store.insert("ab");
+        assert_eq!(idx, LATIN1_NUM);
+        assert_eq!(store.get(idx).unwrap(), "ab");
+
+        // Single chars beyond Latin-1 also intern normally.
+        let idx: u32 = store.insert("€");
+        assert_eq!(store.get(idx).unwrap(), "€");
+    }
+
+    #[test]
+    fn test_default_store() {
+        // The derived `Default` used to produce a store with an empty ascii
+        // table and len == 0, panicking on basic operations.
+        let store: UniqueStrStore = UniqueStrStore::default();
+        assert_eq!(store.len(), LATIN1_NUM as usize);
+
+        let idx: u32 = store.insert("a");
+        assert_eq!(idx, 'a' as u32);
+        assert_eq!(store.get(idx).unwrap(), "a");
+
+        let idx: u32 = store.insert(HELLO);
+        assert_eq!(idx, LATIN1_NUM);
+        assert_eq!(store.get(idx).unwrap(), HELLO);
     }
 
     #[test]

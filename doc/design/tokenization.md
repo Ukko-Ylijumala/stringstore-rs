@@ -16,7 +16,7 @@ Non-delimiter tokens have `is_delim = false` and `delim_idx = None`. Delimiter t
 
 ## `tokenize` (linear scan)
 
-A hand-written O(n · m) scan: for each byte position, walk the delimiter list and check `s[i..].starts_with(d)`. On a match, flush any accumulated non-delimiter content as a `Token`, push the delimiter `Token`, and advance by the delimiter's length. Otherwise, append one `char` to the in-progress non-delimiter and advance by one byte.
+A hand-written O(n · m) scan: for each byte position, walk the delimiter list and check `s[i..].starts_with(d)`. On a match, flush any accumulated non-delimiter content as a `Token`, push the delimiter `Token`, and advance by the delimiter's length. Otherwise, append one `char` to the in-progress non-delimiter and advance by that char's UTF-8 width (advancing by a single byte would land mid-char on multibyte input and panic on the next slice).
 
 **Matching strategy:** first match wins — the delimiter that appears earliest in the `delims` slice is chosen. This matters for overlapping delimiters (see below).
 
