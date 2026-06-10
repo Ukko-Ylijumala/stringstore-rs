@@ -42,6 +42,17 @@ The motivation is twofold:
 1. **Hash/lock avoidance for the common case.** Single-character ISO-8859-1 strings are extremely common in tokenized output (whitespace, punctuation, digits). Routing them through `xxh3 → DashMap → RwLock` would dominate the cost of trivial inserts; the `ascii` short-circuit collapses these to a direct array index.
 2. **Stable "well-known" indices.** Callers can assume `0` is always the empty string and `1..256` are the ISO-8859-1 codepoints, regardless of insertion order, without ever calling `insert`. This makes index 0 usable as a sentinel (see `splitting-and-paths.md`).
 
+## Hash-only identity and the collision policy
+
+The `index` DashMap is keyed by the 64-bit xxh3 hash of the string bytes — within the index, string identity *is* the hash. Two distinct strings colliding on the full 64 bits cannot both be represented (odds are ~n²/2⁶⁵; roughly 1 in 370k for a store holding 10M strings).
+
+The policy as of v0.3.8:
+
+- **`insert` verifies.** On a hash hit — both in the fast path and in the lost-race branch inside `insert_unchecked` — the stored string's contents are compared against the incoming string. A mismatch calls `collision_panic`: a deliberate panic, because silently returning the other string's index would corrupt every downstream index vector. There is no graceful recovery without re-keying the index (e.g. `DashMap<u64, SmallVec<u32>>`); revisit only if a collision is ever observed in the wild.
+- **`contains` and `idx` do not verify.** They remain pure hash lookups (no lock, no content fetch) to keep the read path free of `RwLock` involvement. Consequence: for a string that was *never inserted* but collides with a stored one, `contains` returns a false positive and `idx` returns the colliding string's index. Strings that went through `insert` are unaffected — the insert-time check guarantees no two *stored* strings share a hash.
+
+Cost of the insert-side check: every duplicate `insert` now takes the store read lock and performs one string comparison. The new-string path is unchanged (one hash, one DashMap miss, then the write-locked insert).
+
 ## Index lifetime guarantee
 
 Once a string is inserted, its public index is permanent. There is no removal, shrink, or compaction API — by design. This is what makes the unsafe pointer surface sound; see `unsafe-pointers.md`.

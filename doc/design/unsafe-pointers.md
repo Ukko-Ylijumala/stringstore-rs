@@ -46,6 +46,8 @@ If any of these need to change, the unsafe APIs must be rethought from scratch �
 
 `StoredStrPtr` wraps a `*const str` with no lifetime parameter. It implements `Clone`, `Copy`-shaped patterns, `Hash`, `Ord`, `Display`, `Deref<Target = *const str>`, and `From<StoredStrPtr> for &'a str` for *any* `'a`. None of this is checked.
 
+> $\color{red}{\textbf{WARNING:}}$ **the `From<StoredStrPtr> for &'a str` impl has a completely unconstrained target lifetime.** Safe code can use it to conjure a `&'static str` with no compile-time tie to the originating store. This is *intentional*: a `UniqueStrStore` is meant to live for the remainder of the program — effectively `'static` — so the pointer is assumed to never dangle. If a store in your application is **not** program-lifetime, do not use this conversion (or `StoredStrPtr` at all); the resulting reference can outlive the storage, and using it afterwards is undefined behavior.
+
 The documented contract is: **the pointer is valid only as long as the originating `UniqueStrStore` is alive**. Concretely:
 
 - Storing a `StoredStrPtr` in a `'static` collection is sound *only* if the originating store is itself in a `'static` location (e.g. behind a `OnceLock` or `lazy_static`).

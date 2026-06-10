@@ -165,6 +165,11 @@ impl UniqueStrStore {
     }
 
     /// Whether we already have this string slice stored.
+    ///
+    /// NOTE: this is a pure hash lookup (no content comparison, no locking),
+    /// so a never-inserted string whose 64-bit xxh3 hash collides with a
+    /// stored one yields a false positive. `insert` does verify contents;
+    /// see `doc/design/storage-architecture.md` for the collision policy.
     #[inline]
     pub fn contains(&self, s: &str) -> bool {
         if s.len() == 0 {
@@ -181,6 +186,10 @@ impl UniqueStrStore {
     }
 
     /// Get the index of a stored string slice by its content, if it exists.
+    ///
+    /// NOTE: like `contains`, this is a pure hash lookup — a 64-bit xxh3
+    /// collision with a stored string returns that string's index instead
+    /// of `None`. `insert` is the verified path.
     pub fn idx(&self, s: &str) -> Option<u32> {
         if s.len() == 0 {
             return Some(0);
@@ -269,11 +278,13 @@ impl UniqueStrStore {
 
     /**
     Insert a new string foregoing the first index check before write locking.
+    `key` must be the xxh3 hash of `s` (computed by the caller, so the
+    fast path and this slow path hash only once between them).
 
     We still must check again after acquiring the write locks, as another
     thread might have gone behind our back in the meantime.
     */
-    fn insert_unchecked(&self, s: String) -> u32 {
+    fn insert_unchecked(&self, s: String, key: u64) -> u32 {
         let mut store = self.store.write();
         let len: usize = store.len();
 
@@ -287,7 +298,6 @@ impl UniqueStrStore {
             );
         }
 
-        let key: u64 = hash_bytes(s.as_bytes());
         // next free index
         let idx: u32 = len as u32;
 
@@ -297,12 +307,26 @@ impl UniqueStrStore {
             // we did in fact insert a new string
             store.push(s.into());
             self.len.fetch_add(1);
+        } else {
+            // someone else interned this hash first: make sure it is
+            // actually the same string and not a 64-bit hash collision
+            let stored: &str = &store[indexed as usize];
+            if stored != s {
+                collision_panic(stored, &s, indexed);
+            }
         }
         indexed + LATIN1_NUM
     }
 
-    /// Insert a new string (slice), if it doesn't already exist.
-    /// Returns the index in either case.
+    /**
+    Insert a new string (slice), if it doesn't already exist.
+    Returns the index in either case.
+
+    On a hash hit the existing string's contents are compared against `s`;
+    a mismatch means a genuine 64-bit xxh3 collision, which the hash-keyed
+    index cannot represent, and results in a panic. See
+    `doc/design/storage-architecture.md` for the collision policy.
+    */
     pub fn insert<T>(&self, s: T) -> u32
     where
         T: Into<String>,
@@ -318,12 +342,24 @@ impl UniqueStrStore {
             }
         }
 
-        // For non-ASCII or multi-character strings
-        if let Some(idx) = self.idx(&s) {
-            idx
-        } else {
-            self.insert_unchecked(s)
+        // For non-ASCII or multi-character strings. NOTE: copy the index
+        // out of the DashMap guard before touching the store lock — holding
+        // a shard guard while taking the store lock would invert the
+        // store -> index lock order used by `insert_unchecked`.
+        let key: u64 = hash_bytes(s.as_bytes());
+        if let Some(internal) = self.index.get(&key).map(|r| *r.value()) {
+            // The slot is guaranteed to exist: the entry is only ever
+            // published inside the write-lock critical section that also
+            // pushes the string, so acquiring the read lock here means
+            // that section has completed.
+            let store = self.store.read();
+            let stored: &str = &store[internal as usize];
+            if stored != s {
+                collision_panic(stored, &s, internal);
+            }
+            return internal + LATIN1_NUM;
         }
+        self.insert_unchecked(s, key)
     }
 
     /// The reference of a stored string slice, if it exists.
@@ -339,14 +375,11 @@ impl UniqueStrStore {
     where
         T: Into<String>,
     {
-        let s: String = s.into();
-        if s.is_empty() {
-            return StoredStr(0, self);
-        }
-        if !self.contains(&s) {
-            self.insert_unchecked(s.clone());
-        }
-        self.get_ref(&s).unwrap()
+        // Delegating to `insert` gets us the collision check for free and
+        // avoids the previous contains() -> insert_unchecked() -> get_ref()
+        // dance (which cloned the string and skipped verification when the
+        // hash was already present).
+        StoredStr(self.insert(s), self)
     }
 
     /// Store the parts and return their indices.
@@ -594,9 +627,12 @@ impl UniqueStrStore {
             } else {
                 let found: u32 = *self.index.get(&key).unwrap();
                 if found != sid as u32 {
+                    // a corrupt index value may also be out of bounds; this
+                    // must be reported, not panic the validation itself
+                    let other: &str =
+                        store.get(found as usize).map_or("<out of bounds>", |b| b.as_ref());
                     errs.push(format!(
-                        "index mismatch for str_id {sid} ('{s}'): hash 0x{key:x} -> {found} ('{}')",
-                        &*store[found as usize]
+                        "index mismatch for str_id {sid} ('{s}'): hash 0x{key:x} -> {found} ('{other}')"
                     ));
                 }
             }
@@ -605,10 +641,16 @@ impl UniqueStrStore {
         // Check that each index is valid wrt. the store.
         for itm in self.index.iter() {
             let (key, sid) = itm.pair();
-            if (*sid as usize) >= l_store {
-                errs.push(format!("index out of bounds: {sid} >= {l_store} (hash: 0x{key:x})"));
-            }
-            let s: &Box<str> = unsafe { store.get_unchecked(*sid as usize) };
+            // safe lookup: an out-of-bounds index used to fall through to a
+            // `get_unchecked` here, which is UB — exactly when validation
+            // has found something worth reporting
+            let s: &Box<str> = match store.get(*sid as usize) {
+                Some(s) => s,
+                None => {
+                    errs.push(format!("index out of bounds: {sid} >= {l_store} (hash: 0x{key:x})"));
+                    continue;
+                }
+            };
             let csum: u64 = hash_bytes(s.as_bytes());
             if csum != *key {
                 errs.push(format!(
@@ -742,6 +784,18 @@ impl PartialEq<&str> for StoredStrPtr {
 
 /* --------------------------------- */
 
+/**
+Convert a [StoredStrPtr] into a plain string slice.
+
+<b style="color:red">WARNING: the target lifetime `'a` is completely
+unconstrained.</b> Safe code can use this impl to conjure a `&'static str`
+(or any other lifetime) with no compile-time tie to the originating
+[UniqueStrStore]. This is intentional: the store is meant to live for the
+remainder of the program (effectively `'static`), so the pointer is assumed
+to never dangle. If your store is **not** program-lifetime, do not use this
+conversion — the resulting reference can outlive the storage, and using it
+after the store is dropped is undefined behavior.
+*/
 impl<'a> From<StoredStrPtr> for &'a str {
     fn from(v: StoredStrPtr) -> &'a str {
         unsafe { &*v.0 }
@@ -1023,25 +1077,30 @@ impl Hex {
     }
 
     fn to_string(&self, fmt: HexFormat) -> String {
+        // Order matters: the "0x" prefix must be applied last so that it is
+        // neither uppercased ("0X...") nor counted into the column grouping.
         let mut result: String = format!("{:x}", self.0);
-        if fmt.is_prefix() {
-            result = format!("0x{}", result);
-        }
         if fmt.is_upper() {
             result = result.to_uppercase();
         }
         if fmt.is_columns() {
+            // group by 4 digits counting from the *right*, like a numeric
+            // separator: 0xfeedf00d5 -> "f:eedf:00d5"
+            let n: usize = result.len();
             result = result
                 .chars()
                 .enumerate()
                 .map(|(i, c)| {
-                    if i % 4 == 0 && i != 0 {
-                        format!(":{}{}", c, i)
+                    if i != 0 && (n - i).is_multiple_of(4) {
+                        format!(":{c}")
                     } else {
                         c.to_string()
                     }
                 })
                 .collect();
+        }
+        if fmt.is_prefix() {
+            result = format!("0x{}", result);
         }
         result
     }
@@ -1094,6 +1153,10 @@ impl HexFormat {
         if self.is_upper() { parts.push("Upper"); }
         if self.is_prefix() { parts.push("Prefix"); }
         if self.is_columns() { parts.push("Columns"); }
+        if parts.is_empty() {
+            // non-zero but no known flag bits set
+            return format!("Unknown(0b{:b})", self.0);
+        }
         parts.join("|")
     }
 }
@@ -1260,6 +1323,19 @@ pub fn tokenize_regex(s: &str, delims: &[&str]) -> Vec<Token> {
 }
 
 /* ########################## UTILITY FUNCTIONS ############################ */
+
+/// A genuine 64-bit xxh3 collision between two distinct strings. The index
+/// is keyed by hash alone, so the store cannot represent both — and silently
+/// returning the other string's index would corrupt every downstream user.
+#[cold]
+#[inline(never)]
+fn collision_panic(stored: &str, new: &str, internal: u32) -> ! {
+    panic!(
+        "xxh3 hash collision: new string '{new}' hashes identically to stored \
+         string '{stored}' (internal index {internal}); UniqueStrStore cannot \
+         represent both"
+    );
+}
 
 /// Check whether a string consists of exactly one ISO-8859-1 codepoint,
 /// and if so, return it. Otherwise (incl. empty string), return None.
@@ -1830,6 +1906,28 @@ mod tests {
             store.reconstruct(&parts3, store.idx(PATH_SEP).unwrap()).unwrap(),
             "input <-> reconstruct() mismatch (path3)"
         );
+    }
+
+    #[test]
+    fn test_hex_to_string() {
+        let h: Hex = Hex(0xdeadbeef);
+        assert_eq!(h.to_string(HexFormat::PLAIN), "deadbeef");
+        assert_eq!(h.to_string(HexFormat::UPPER), "DEADBEEF");
+        assert_eq!(h.to_string(HexFormat::PREFIX), "0xdeadbeef");
+        assert_eq!(h.to_string(HexFormat::COLUMNS), "dead:beef");
+
+        // groups count from the right when the digit count isn't a multiple of 4
+        assert_eq!(Hex(0xfeedf00d5).to_string(HexFormat::COLUMNS), "f:eedf:00d5");
+        assert_eq!(Hex(0x5).to_string(HexFormat::COLUMNS), "5");
+
+        // the "0x" prefix is applied last: neither uppercased nor grouped
+        let all: HexFormat =
+            HexFormat(HexFormat::UPPER.0 | HexFormat::PREFIX.0 | HexFormat::COLUMNS.0);
+        assert_eq!(h.to_string(all), "0xDEAD:BEEF");
+
+        assert_eq!(all.to_string(), "Upper|Prefix|Columns");
+        assert_eq!(HexFormat::PLAIN.to_string(), "Plain");
+        assert_eq!(HexFormat(0b1000).to_string(), "Unknown(0b1000)");
     }
 
     #[test]

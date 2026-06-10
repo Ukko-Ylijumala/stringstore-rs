@@ -27,26 +27,40 @@ This is also what makes `contains` and `idx` close to free under contention: a w
 
 ```text
                        ┌─── empty? ──► return 0
-        insert(s) ─────┼─── single ASCII? ──► return codepoint index
+        insert(s) ─────┼─── single ISO-8859-1 char? ──► return codepoint index
                        │
-                       └─── idx(&s).is_some()? ──► return existing index   (fast path, no write lock)
-                                  │
-                                  └── insert_unchecked(s):
-                                        1. take store write lock
-                                        2. compute key = hash_bytes(s)
-                                        3. idx = store.len() as u32        // tentative internal index
-                                        4. indexed = *index.entry(key).or_insert(idx)
-                                        5. if indexed == idx:
-                                              store.push(s.into())
-                                              len.fetch_add(1)
-                                        6. return indexed + LATIN1_NUM
+                       │    key = hash_bytes(s)
+                       └─── index.get(&key) hit? ──► take store READ lock,
+                       │         compare contents:                (fast path,
+                       │           equal    ──► return existing index    no write lock)
+                       │           mismatch ──► collision_panic
+                       │
+                       └── miss ──► insert_unchecked(s, key):
+                                      1. take store write lock
+                                      2. idx = store.len() as u32        // tentative internal index
+                                      3. indexed = *index.entry(key).or_insert(idx)
+                                      4. if indexed == idx:
+                                            store.push(s.into())
+                                            len.fetch_add(1)
+                                         else:
+                                            compare store[indexed] vs s   // lost the race —
+                                            mismatch ──► collision_panic  // same string or collision?
+                                      5. return indexed + LATIN1_NUM
 ```
+
+The hash is computed once, in the public `insert`, and passed into `insert_unchecked`.
 
 ### Why the recheck after taking the write lock
 
-Step 4 is the atomic decision point — **not** the earlier `idx()` call in the public `insert`. Between the `idx()` lookup and acquiring the write lock, another thread can win the race and insert the same string. The DashMap `entry().or_insert(idx)` resolves this: only the thread whose `idx` was actually inserted into the map is permitted to push into `store`.
+Step 3 is the atomic decision point — **not** the earlier hash lookup in the public `insert`. Between that lookup and acquiring the write lock, another thread can win the race and insert the same string. The DashMap `entry().or_insert(idx)` resolves this: only the thread whose `idx` was actually inserted into the map is permitted to push into `store`.
 
-If a refactor moves the `idx()` check inside the write-lock region, the recheck still has to remain — two threads can both pass the `idx()` check before *either* takes the write lock.
+If a refactor moves the hash-hit check inside the write-lock region, the recheck still has to remain — two threads can both miss before *either* takes the write lock.
+
+### The lock-ordering rule in the fast path
+
+The fast path copies the `u32` out of the DashMap guard (`self.index.get(&key).map(|r| *r.value())`) **before** taking the store read lock. Holding a shard guard across the store lock acquisition would invert the store → index lock order used by `insert_unchecked` (which takes the store write lock first, then touches the DashMap) and deadlock under contention. Keep it that way.
+
+The copied index stays valid after the guard drops: index entries are never modified or removed, and the slot is guaranteed to be populated by the time the read lock is acquired — the entry is only ever published inside the same write-lock critical section that pushes the string.
 
 ### Why the write lock is taken before consulting the DashMap
 
@@ -61,9 +75,16 @@ The losing thread:
 - Allocated a `String` (in the public `insert<T: Into<String>>` wrapper).
 - Did not call `store.push`.
 - Did not call `len.fetch_add`.
+- Compared its string against the winner's (collision check; panics on mismatch).
 - Returns the *winner's* index.
 
 The local `String` is dropped at scope exit. No `Box<str>` is allocated on the losing path — the allocation only happens inside `store.push(s.into())`.
+
+## Transient `idx()`/`get()` disagreement during insert
+
+Inside `insert_unchecked`, the DashMap entry is published (step 3) *before* `store.push` completes (step 4) — both inside the write-lock critical section, but the DashMap is readable without that lock. A concurrent bare `idx(s)` can therefore return an index for which `get(idx)` momentarily returns `Err(IndexOutOfBounds)`: `get` consults the `len` counter, which is incremented last. The window closes when the writer releases the lock.
+
+Nothing dangles — `borrow_str`/`get_str_ptr` block on the read lock, so they cannot observe the half-inserted state; the disagreement is only between `idx()`'s answer and `get()`'s bounds check. The `insert` fast path is immune: it acquires the read lock before dereferencing, which serializes it after the writer's critical section. Callers who treat `idx() == Some(i)` as a promise that `get(i)` succeeds *right now* (rather than eventually) are the only ones who can notice.
 
 ## `validate_contents` takes a write lock
 
