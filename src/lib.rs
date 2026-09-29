@@ -509,9 +509,10 @@ impl UniqueStrStore {
     - If `delims` is empty, the function returns a Vec of the index of `s`
       itself (assuming `s` is not empty), and an empty Vec for delimiters.
 
-    NOTE: the two tokenizers are based on different logic and might yield
-    differing results for the same input, especially if there is any overlap
-    between the provided delimiters. YMMV, buyer beware etc. (WIP)
+    NOTE: the two tokenizers are implemented differently but share the same
+    matching semantics (leftmost-first, earliest delimiter in `delims` wins),
+    so they yield identical output for the same input — including overlapping
+    delimiters. `force_regex` only affects performance, never the result.
     */
     pub fn split_and_store_multi(
         &self,
@@ -1374,6 +1375,9 @@ The delimiters are included as separate tokens.
 
 In contrast to `tokenize()`, this version compiles a regex to find the
 delimiters, which should be faster for larger strings and more delimiters.
+The output is identical to `tokenize()` for every input: both implement
+leftmost-first matching with the earliest delimiter in `delims` winning
+at a given position (see `doc/design/tokenization.md`).
 */
 pub fn tokenize_regex(s: &str, delims: &[&str]) -> Vec<Token> {
     // Skip empty delimiters: an empty alternative in the regex would match
@@ -1397,7 +1401,16 @@ pub fn tokenize_regex(s: &str, delims: &[&str]) -> Vec<Token> {
         .map(|p: &&str| escape(p))
         .collect::<Vec<_>>()
         .join("|");
-    let re: Regex = Regex::new(&pattern).unwrap();
+    /*
+    The pattern is a plain alternation of escaped literals, so the only way
+    compilation can fail is the regex crate's compiled-size limit on an
+    enormous delimiter set. The linear tokenizer produces identical output,
+    so fall back to it instead of panicking on caller-controlled input.
+    */
+    let re: Regex = match Regex::new(&pattern) {
+        Ok(re) => re,
+        Err(_) => return tokenize(s, delims),
+    };
     let mut tokens: Vec<Token> = Vec::new();
     let mut last_end: usize = 0;
 
@@ -1721,6 +1734,41 @@ mod tests {
         assert_eq!(tokens[1].content, "→");
         assert!(tokens[1].is_delim);
         assert_eq!(tokens[2].content, "b");
+    }
+
+    #[test]
+    fn test_tokenizers_are_equivalent() {
+        /*
+        Both tokenizers implement leftmost-first matching with the earliest
+        delimiter in `delims` winning, so they must agree on every input,
+        including overlapping delimiters ("ab" vs "abc", "a" vs "aa"), and
+        duplicated or empty delimiters. Deterministic LCG so a failure is
+        reproducible from the seed.
+        */
+        const ALPHABET: [&str; 4] = ["a", "b", "c", "é"];
+        const DELIM_POOL: [&str; 11] =
+            ["a", "b", "c", "ab", "ba", "abc", "bc", "aa", "é", "aé", ""];
+        let mut seed: u64 = 42;
+        let mut next = move |modulus: u64| -> usize {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 33) % modulus) as usize
+        };
+
+        for case in 0..5000 {
+            let n_delims: usize = 1 + next(5);
+            let delims: Vec<&str> = (0..n_delims).map(|_| DELIM_POOL[next(11)]).collect();
+            let len: usize = next(12);
+            let s: String = (0..len).map(|_| ALPHABET[next(4)]).collect();
+
+            let linear: Vec<Token> = tokenize(&s, &delims);
+            let regex: Vec<Token> = tokenize_regex(&s, &delims);
+            assert_eq!(
+                linear, regex,
+                "case {case}: tokenizers diverge on {s:?} with delims {delims:?}"
+            );
+        }
     }
 
     #[test]

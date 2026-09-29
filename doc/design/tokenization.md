@@ -47,15 +47,20 @@ Callers can override the choice with `force_regex`:
 - `Some(true)` — force the regex tokenizer.
 - `Some(false)` — force the linear tokenizer.
 
-## Known divergence on overlapping delimiters
+## Overlapping delimiters: the tokenizers are equivalent
 
-The two tokenizers can produce **different output** when delimiters overlap or share prefixes. The library acknowledges this in the doc comment on `split_and_store_multi`:
+The two tokenizers are implemented differently but produce **identical output for every input**, including overlapping delimiters or delimiters that share a prefix. Both implement the same rule: at the leftmost position where any delimiter matches, the delimiter that appears earliest in the `delims` slice wins, and scanning resumes after it.
 
-> NOTE: the two tokenizers are based on different logic and might yield differing results for the same input, especially if there is any overlap between the provided delimiters. YMMV, buyer beware etc. (WIP)
+- `tokenize` walks byte positions left to right and, at each one, takes the first delimiter in slice order that is a prefix of the remainder.
+- `tokenize_regex` compiles `escape(d0) | escape(d1) | ...` and relies on the `regex` crate's leftmost-first semantics, which for an alternation of literals means exactly the same thing: smallest start position first, then earliest alternative.
 
-A concrete shape where this can happen: delimiters `["ab", "abc"]` against input `"xabcy"`. The linear tokenizer matches `"ab"` first (it appears earlier in the slice) and continues from `"cy"`. The regex tokenizer's leftmost-first alternation also takes `"ab"` first, but the engine's behavior around overlapping alternatives in the same start position is implementation-defined enough that callers should not rely on equivalence in these cases. The crate's existing tests deliberately use non-overlapping delimiters to avoid the question.
+A delimiter is a valid UTF-8 string, so a match inside a valid UTF-8 input always starts on a char boundary; the regex crate guarantees this as well. `tokenize` advances by whole chars when nothing matches, so the two never disagree on where a match may start either.
 
-If you need deterministic behavior with overlapping delimiters: sort the delimiter slice longest-first before calling, and prefer `force_regex = Some(false)` so you can reason about the loop.
+The test `test_tokenizers_are_equivalent` checks this property on thousands of generated inputs over a tiny alphabet with deliberately overlapping, duplicated, and empty delimiters (`"ab"`/`"abc"`, `"a"`/`"aa"`, `"é"`/`"aé"`, `""`). An earlier version of this document hedged that the two might diverge on such input; they do not, and `force_regex` is purely a performance knob.
+
+Concretely, for `["ab", "abc"]` against `"xabcy"` both produce `["x", "ab", "cy"]`. If you want the longest delimiter to win instead, sort the delimiter slice longest-first before calling.
+
+`tokenize_regex` falls back to `tokenize` if the regex crate refuses to compile the pattern (its compiled-size limit). Because the outputs are identical, callers cannot observe which implementation ran.
 
 ## Empty delimiter handling
 
