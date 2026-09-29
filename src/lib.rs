@@ -187,8 +187,8 @@ impl UniqueStrStore {
             return true; // empty string is always contained
         }
 
-        // ISO-8859-1 codepoints are implicitly contained. NOTE: codepoints
-        // 128-255 are 2 bytes in UTF-8, hence the `<= 2` byte-length gate.
+        // ISO-8859-1 codepoints (minus NUL) are implicitly contained. NOTE:
+        // codepoints 128-255 are 2 bytes in UTF-8, hence the `<= 2` gate.
         if s.len() <= 2 && return_iso8859_1_cp(s).is_some() {
             return true;
         }
@@ -1437,12 +1437,16 @@ Check whether a string consists of exactly one ISO-8859-1 codepoint,
 and if so, return it. Otherwise (incl. empty string), return None.
 Note: codepoints 128-255 are *two* bytes in UTF-8, so callers must not
 pre-filter on byte length == 1.
+
+NUL (`'\0'`, codepoint 0) is deliberately excluded: index 0 holds the
+empty string, not NUL, so a NUL string must go through the regular
+hash-indexed path like any other content.
 */
 #[inline]
 fn return_iso8859_1_cp(s: &str) -> Option<u32> {
     let mut chars = s.chars();
     let c: u32 = chars.next()? as u32;
-    if c < LATIN1_NUM && chars.next().is_none() {
+    if c != 0 && c < LATIN1_NUM && chars.next().is_none() {
         return Some(c);
     }
     None
@@ -1723,6 +1727,27 @@ mod tests {
         // Single chars beyond Latin-1 also intern normally.
         let idx: u32 = store.insert("€");
         assert_eq!(store.get(idx).unwrap(), "€");
+    }
+
+    #[test]
+    fn test_nul_is_not_the_empty_string() {
+        /*
+        Index 0 holds the empty string, not '\0'. The Latin-1 fast path
+        used to accept codepoint 0, so a NUL string mapped to index 0
+        and read back as "".
+        */
+        let store: UniqueStrStore = UniqueStrStore::new();
+        assert!(!store.contains("\0"), "NUL must not be implicitly contained");
+        assert_eq!(store.idx("\0"), None);
+
+        let idx: u32 = store.insert("\0");
+        assert!(idx >= LATIN1_NUM, "NUL must be interned as regular content, got {idx}");
+        assert_eq!(store.get(idx).unwrap(), "\0");
+        assert_eq!(store.get(0).unwrap(), "");
+        assert!(store.contains("\0"));
+        assert_eq!(store.idx("\0"), Some(idx));
+        assert_eq!(store.insert("\0"), idx, "second insert must dedup");
+        store.validate_contents().ok();
     }
 
     #[test]

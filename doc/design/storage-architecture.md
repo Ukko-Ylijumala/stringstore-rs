@@ -13,7 +13,7 @@ content lookup:        index: Arc<DashMap<u64 xxh3 hash, u32 internal index>>
 length:                len: Arc<AtomicU32>  // public length, starts at 256
 ```
 
-1. **`ascii: Arc<Vec<Box<str>>>`** — a fixed 256-entry vector populated once at construction with every ISO-8859-1 codepoint as a one-character `Box<str>`. The empty string `""` replaces `'\0'` at index 0. Read access skips both the `RwLock` and the hash map entirely.
+1. **`ascii: Arc<Vec<Box<str>>>`** — a fixed 256-entry vector populated once at construction with every ISO-8859-1 codepoint as a one-character `Box<str>`. The empty string `""` replaces `'\0'` at index 0, so a NUL string is *not* covered by this table: `return_iso8859_1_cp` rejects codepoint 0 and `"\0"` is interned through the regular hash-indexed path like any other content. Read access skips both the `RwLock` and the hash map entirely.
 2. **`store: Arc<RwLock<Vec<Box<str>>>>`** — the actual interned strings. Internally indexed `0..N`, but every public-facing index is offset by `LATIN1_NUM` (256).
 3. **`index: Arc<DashMap<u64, u32, CustomXxh3Hasher>>`** — content-to-position lookup, keyed by the xxh3 hash of the bytes. The stored value is the *internal* `store` index (pre-offset).
 
