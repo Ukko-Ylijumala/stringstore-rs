@@ -4,7 +4,7 @@
 
 ## Locking primitives
 
-- `store`: `parking_lot::RwLock<Vec<Box<str>>>` — writers exclusive, readers shared.
+- `store`: `parking_lot::RwLock<StrArena>` (slot vector plus bump chunks) — writers exclusive, readers shared.
 - `index`: `dashmap::DashMap<u64, u32, PreHashed>` — internally sharded, lock-free for non-conflicting keys. `PreHashed` is an identity hasher (the keys are xxh3 digests already; see `storage-architecture.md`).
 - `len`: `std::sync::atomic::AtomicU32` — atomic public length counter. Incremented with `Release` (under the write lock, after the push); `len()` loads with `Acquire`, so a reader that observes the new length is guaranteed to see the pushed element.
 - `ascii`: no synchronization — built once at construction, never mutated.
@@ -42,7 +42,7 @@ This is also what makes `contains` and `idx` close to free under contention: a w
                                       2. idx = store.len() as u32        // tentative internal index
                                       3. indexed = *index.entry(key).or_insert(idx)
                                       4. if indexed == idx:
-                                            store.push(s.into())
+                                            store.push(s)   // memcpy into the arena
                                             len.fetch_add(1)
                                          else:
                                             compare store[indexed] vs s   // lost the race —
@@ -52,7 +52,7 @@ This is also what makes `contains` and `idx` close to free under contention: a w
 
 The hash is computed once (in `insert_internal`, shared by `insert` and `try_insert`) and passed into `insert_unchecked`. `try_insert` is the identical flow with one difference: a full store surfaces as `Err(StoreFull)` instead of a panic.
 
-The whole path borrows: `insert<T: AsRef<str>>` never copies the input string. The single allocation is the `Box<str>` created inside `store.push(s.into())` — and only on the thread that actually inserts. The already-interned case (the hot path) allocates nothing.
+The whole path borrows: `insert<T: AsRef<str>>` never copies the input string until `store.push(s)` memcpys it into the arena — and only on the thread that actually inserts. That copy allocates nothing in the common case; a fresh 128 KiB chunk is allocated only when the current one is full (or a dedicated one for a string longer than a chunk). The already-interned case (the hot path) allocates nothing.
 
 ### Why the recheck after taking the write lock
 
@@ -81,10 +81,10 @@ The losing thread:
 - Allocated nothing (`insert<T: AsRef<str>>` only borrows the input).
 - Did not call `store.push`.
 - Did not call `len.fetch_add`.
-- Compared its string against the winner's (collision check; panics on mismatch).
+- Compared its string against the winner's (collision check; panics on mismatch — 64-bit keys only).
 - Returns the *winner's* index.
 
-No `Box<str>` is allocated on the losing path — the only allocation on the entire insert path happens inside the winner's `store.push(s.into())`.
+Nothing is copied on the losing path — the only copy on the entire insert path happens inside the winner's `store.push(s)`.
 
 ## `idx()` and `get()` agree, even mid-insert
 

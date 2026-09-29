@@ -22,6 +22,7 @@ Single-file library crate. All public and internal types are in `src/lib.rs`. Ro
 | Lines (approx.) | Contents |
 |---|---|
 | `UniqueStrStore` and its impl | The main interner type and every public method |
+| `StoreInner`, `PreHashed`, `StrArena` | The shared state behind the `Arc`, the identity hasher for the index, and the chunked bump arena holding string bytes (`ARENA_CHUNK_SIZE` default, per-store override via `new_with_capacity`) |
 | `StoredStrPtr` | Raw-pointer handle to an interned string (unsafe lifetime) |
 | `StoredStr<'a>` | Safe lifetime-tracked handle |
 | `CompactStr`, `Character`, `TextElement`, `StructuredLine`, `Hex`, `HexFormat`, `Integer` | **Dormant scaffolding** for a structured-text feature; not exported, not tested |
@@ -34,7 +35,7 @@ Single-file library crate. All public and internal types are in `src/lib.rs`. Ro
 
 The design of the non-obvious bits lives in [`doc/design/`](doc/design/README.md). Read the relevant doc before changing behavior in that area — each calls out invariants that the type system does not enforce.
 
-- **[Storage architecture](doc/design/storage-architecture.md)** — the three-container split (`ascii` + `store` + `index`) and the load-bearing `LATIN1_NUM = 256` offset between public and internal indices. Required reading before touching anything index-related.
+- **[Storage architecture](doc/design/storage-architecture.md)** — the three-container split (`ascii` + `store` + `index`), the arena that holds the string bytes, and the load-bearing `LATIN1_NUM = 256` offset between public and internal indices. Required reading before touching anything index-related.
 - **[Concurrency model](doc/design/concurrency.md)** — RwLock + DashMap lock ordering and the post-lock recheck in `insert_unchecked`. Required reading before changing the insert path.
 - **[Unsafe pointer surface](doc/design/unsafe-pointers.md)** — `borrow_str`, `StoredStrPtr`, and the append-only invariant that keeps them sound. Required reading before adding any removal/mutation API.
 - **[Tokenization](doc/design/tokenization.md)** — the byte-class scanner, its leftmost-first contract, why byte-wise stepping is UTF-8 safe, the empty-delimiter footgun, and where richer tokenization rules should plug in.

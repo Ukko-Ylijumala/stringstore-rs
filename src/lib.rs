@@ -13,10 +13,10 @@ use std::{
     fmt::{self, Debug, Display, Formatter},
     hash::{BuildHasher, Hash, Hasher},
     net::IpAddr, //Ipv4Addr, Ipv6Addr},
-    ops::Deref,
+    ops::{Deref, Index},
     path::{Path, PathBuf},
     ptr,
-    str::{FromStr, Split},
+    str::{self, FromStr, Split},
     sync::{
         atomic::{AtomicU32, Ordering as AtomicOrdering},
         Arc,
@@ -33,6 +33,11 @@ const PATH_SEP: &str = "/";
 const LATIN1_NUM: u32 = 256;
 /// Maximum number of user-inserted strings; see `insert_unchecked`.
 const MAX_USER_STRINGS: usize = (u32::MAX - LATIN1_NUM) as usize;
+/// Default size in bytes of one [StrArena] chunk; `new_with_capacity` can
+/// override it per store. 128 KiB is well above any typical string, so
+/// the wasted tail per chunk is negligible, and small enough that a store
+/// with a handful of strings does not reserve much.
+pub const ARENA_CHUNK_SIZE: usize = 128 * 1024;
 
 /**
 The index key: an xxh3 digest of the string bytes.
@@ -62,12 +67,14 @@ in scenarios where many duplicate strings are used.
 - Efficient: each unique string is stored only once.
 - Fast lookups: O(1) average complexity for both index and content-based lookups.
 - Stable indexing: once a string is stored, its index remains constant.
-- Allocations: uses [Box<str>] for heap allocation of strings.
+- Allocations: string bytes live in a chunked bump arena (one allocation
+  per chunk, not per string); see `StrArena`.
 - the empty string ("") always occupies the first index (0).
 - ISO-8859-1 codepoints: contained explicitly, at indices 1-255 (minus '\0').
 
 ## Design Considerations
-- Uses a [Vec<Box<str>>] for string storage, which is efficient for random access,
+- Uses a [Vec] of fat pointers into arena chunks for string storage, which is
+  efficient for random access,
   and should help with cache locality as well.
 - Uses a [DashMap] with `u64` Xxh3 string hashes as keys for fast lookups.
 - Custom [xxhash_rust] hasher ([CustomXxh3Hasher]) for potentially faster hashing.
@@ -135,7 +142,7 @@ through one pointer instead of four separately allocated ones.
 */
 #[derive(Debug)]
 struct StoreInner {
-    store: RwLock<Vec<Box<str>>>,
+    store: RwLock<StrArena>,
     index: DashMap<HashKey, u32, PreHashed>,
     ascii: Vec<Box<str>>,
     len: AtomicU32,
@@ -196,6 +203,182 @@ impl SizeOf for PreHashed {
     fn size_of_children(&self, _context: &mut Context) {}
 }
 
+/**
+Append-only bump arena holding the bytes of every user-inserted string.
+
+Strings are copied back to back into fixed-size chunks (`Box<[u8]>`) that
+are never resized, moved or freed until the arena is dropped; a string
+longer than a chunk gets a dedicated chunk of exactly its own size. One
+fat pointer per string, in internal index order, lives in `slots`.
+
+Compared to one `Box<str>` per string this removes the allocator's
+per-allocation overhead (glibc's smallest block is 32 bytes, so a 9-byte
+string used to cost 32 bytes of heap plus its 16-byte slot; it now costs
+9 plus 16), takes the `malloc` call out of the write-lock critical
+section, and makes drop O(chunks) instead of O(strings). Measurements are
+in `doc/design/storage-architecture.md`.
+
+The pointer-stability argument in `doc/design/unsafe-pointers.md` keeps
+its shape: `chunks` may reallocate as it grows, which moves the `Box`
+handles but never the bytes they own.
+*/
+struct StrArena {
+    /// bump chunks of `chunk_size` bytes; the last one is being filled
+    chunks: Vec<Box<[u8]>>,
+    /// exact-size chunks for strings longer than `chunk_size`
+    oversized: Vec<Box<[u8]>>,
+    /// bytes used in the last element of `chunks`
+    cursor: usize,
+    chunk_size: usize,
+    /// one pointer per interned string, in internal index order
+    slots: Vec<*const str>,
+}
+
+/*
+SAFETY: every pointer in `slots` addresses bytes owned by a chunk in the
+same struct. The bytes are written once, under `&mut self`, before the
+pointer is published, and are freed only when the whole arena drops.
+Sharing a `StrArena` across threads (behind the store's `RwLock`) is
+therefore no different from sharing a `Vec<Box<str>>`.
+*/
+unsafe impl Send for StrArena {}
+unsafe impl Sync for StrArena {}
+
+impl StrArena {
+    fn with_capacity(slots: usize, chunk_size: usize) -> Self {
+        Self {
+            chunks: Vec::new(),
+            oversized: Vec::new(),
+            cursor: 0,
+            chunk_size: chunk_size.max(1),
+            slots: Vec::with_capacity(slots),
+        }
+    }
+
+    /// Number of stored strings, which is also the next internal index.
+    #[inline]
+    fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// Copy `s` into the arena and append its slot.
+    fn push(&mut self, s: &str) {
+        let n: usize = s.len();
+
+        if n > self.chunk_size {
+            // does not fit any chunk: give it an allocation of its own
+            let chunk: Box<[u8]> = s.as_bytes().into();
+            // SAFETY: the bytes are a verbatim copy of a `&str`
+            let ptr: *const str = unsafe { str::from_utf8_unchecked(&chunk) } as *const str;
+            self.oversized.push(chunk);
+            self.slots.push(ptr);
+            return;
+        }
+
+        if self.chunks.is_empty() || self.cursor + n > self.chunk_size {
+            self.chunks.push(vec![0u8; self.chunk_size].into_boxed_slice());
+            self.cursor = 0;
+        }
+        let start: usize = self.cursor;
+        let chunk: &mut [u8] = self.chunks.last_mut().expect("a chunk was just ensured");
+        let dst: &mut [u8] = &mut chunk[start..start + n];
+        dst.copy_from_slice(s.as_bytes());
+        // SAFETY: `dst` was just filled from a `&str`, so it is valid UTF-8
+        let ptr: *const str = unsafe { str::from_utf8_unchecked(dst) } as *const str;
+        self.cursor = start + n;
+        self.slots.push(ptr);
+    }
+
+    /// The string at internal index `i`, if it exists.
+    #[inline]
+    fn get(&self, i: usize) -> Option<&str> {
+        // SAFETY: see the struct-level invariant on `slots`
+        self.slots.get(i).map(|&p| unsafe { &*p })
+    }
+
+    /**
+    The string at internal index `i` without a bounds check.
+
+    # Safety
+    `i` must be `< self.len()`.
+    */
+    #[inline]
+    unsafe fn get_unchecked(&self, i: usize) -> &str {
+        &**self.slots.get_unchecked(i)
+    }
+
+    /// All stored strings in internal index order.
+    fn iter(&self) -> impl Iterator<Item = &str> {
+        // SAFETY: see the struct-level invariant on `slots`
+        self.slots.iter().map(|&p| unsafe { &*p })
+    }
+
+    /// Total bytes of string payload stored.
+    fn bytes_used(&self) -> usize {
+        self.iter().map(str::len).sum()
+    }
+}
+
+impl Index<usize> for StrArena {
+    type Output = str;
+
+    #[inline]
+    fn index(&self, i: usize) -> &str {
+        self.get(i).expect("StrArena index out of bounds")
+    }
+}
+
+/// `Debug` helper: lists the arena's strings without collecting them.
+struct StrArenaStrings<'a>(&'a StrArena);
+
+impl Debug for StrArenaStrings<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(self.0.iter()).finish()
+    }
+}
+
+impl Debug for StrArena {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StrArena")
+            .field("len", &self.slots.len())
+            .field("chunks", &self.chunks.len())
+            .field("oversized", &self.oversized.len())
+            .field("chunk_size", &self.chunk_size)
+            .field("bytes_used", &self.bytes_used())
+            .field("strings", &StrArenaStrings(self))
+            .finish()
+    }
+}
+
+#[cfg(feature = "size_of")]
+impl SizeOf for StrArena {
+    fn size_of_children(&self, context: &mut Context) {
+        // every chunk is one allocation; only the tail of the chunk
+        // currently being filled is slack
+        for chunk in self.chunks.iter().chain(self.oversized.iter()) {
+            context.add(chunk.len()).add_distinct_allocation();
+        }
+        if let Some(last) = self.chunks.last() {
+            context.add_excess(last.len() - self.cursor);
+        }
+        for (len, cap) in [
+            (self.chunks.len(), self.chunks.capacity()),
+            (self.oversized.len(), self.oversized.capacity()),
+        ] {
+            if cap > 0 {
+                context
+                    .add_vectorlike(len, cap, size_of::<Box<[u8]>>())
+                    .add_distinct_allocation();
+            }
+        }
+        if self.slots.capacity() > 0 {
+            context
+                .add_vectorlike(self.slots.len(), self.slots.capacity(), size_of::<*const str>())
+                .add_distinct_allocation();
+        }
+    }
+}
+
 // The derived `Default` would bypass `new()` and produce a store with an
 // empty `ascii` table and `len == 0`, violating every invariant.
 impl Default for UniqueStrStore {
@@ -205,12 +388,20 @@ impl Default for UniqueStrStore {
 }
 
 impl UniqueStrStore {
-    /// Create a new [UniqueStrStore] with a default capacity of 128.
+    /// Create a new [UniqueStrStore] with a default capacity of 128 and
+    /// the default arena chunk size ([ARENA_CHUNK_SIZE]).
     pub fn new() -> Self {
-        Self::new_with_capacity(128)
+        Self::new_with_capacity(128, ARENA_CHUNK_SIZE)
     }
 
-    pub fn new_with_capacity(capacity: usize) -> Self {
+    /**
+    Create a new [UniqueStrStore] sized for `capacity` strings, with string
+    bytes stored in arena chunks of `chunk_size` bytes (see [StrArena];
+    [ARENA_CHUNK_SIZE] is the default). A string longer than `chunk_size`
+    gets an allocation of its own, so any size works; a chunk size below
+    the typical string length just degrades to one allocation per string.
+    */
+    pub fn new_with_capacity(capacity: usize, chunk_size: usize) -> Self {
         // Make the ISO-8859-1 codepoint Vec. Its first element
         // is always the empty string.
         let mut latin1: Vec<Box<str>> = (0..LATIN1_NUM)
@@ -223,7 +414,7 @@ impl UniqueStrStore {
         latin1[0] = EMPTY_STR.into();
 
         UniqueStrStore(Arc::new(StoreInner {
-            store: RwLock::new(Vec::with_capacity(capacity)),
+            store: RwLock::new(StrArena::with_capacity(capacity, chunk_size)),
             index: DashMap::with_capacity_and_hasher(capacity, PreHashed::default()),
             ascii: latin1,
             len: AtomicU32::new(LATIN1_NUM),
@@ -321,7 +512,7 @@ impl UniqueStrStore {
             return Some(self.0.ascii[idx as usize].as_ref() as *const str);
         }
         let store = self.0.store.read();
-        store.get((idx - LATIN1_NUM) as usize).map(|b| &**b as *const str)
+        store.get((idx - LATIN1_NUM) as usize).map(|s: &str| s as *const str)
     }
 
     /**
@@ -334,8 +525,9 @@ impl UniqueStrStore {
     magic, as returning a [Box::as_ref] directly would make the borrow
     checker complain of "cannot return value referencing local variable".
 
-    This is safe because we're returning a pointer to a stored string in the
-    heap, which shouldn't move, while the owning [Box] could be moved around.
+    This is safe because we're returning a pointer to string bytes inside an
+    arena chunk, which never move, while the chunk's owning [Box] handle
+    (and the slot vector) may be moved around.
 
     This should work too, but is more complicated:
     ```ignore
@@ -351,7 +543,7 @@ impl UniqueStrStore {
             self.0.ascii[idx as usize].as_ref() as *const str
         } else {
             let store = self.0.store.read();
-            store.get_unchecked((idx - LATIN1_NUM) as usize).as_ref() as *const str
+            store.get_unchecked((idx - LATIN1_NUM) as usize) as *const str
         }
     }
 
@@ -416,9 +608,9 @@ impl UniqueStrStore {
         // atomic get or insert
         let indexed: u32 = *self.0.index.entry(key).or_insert(idx);
         if indexed == idx {
-            // we did in fact insert a new string; this `Box<str>` is the
-            // only allocation on the entire insert path
-            store.push(s.into());
+            // we did in fact insert a new string: copy it into the arena
+            // (no per-string allocation; a new chunk only every 128 KiB)
+            store.push(s);
             self.0.len.fetch_add(1, AtomicOrdering::Release);
         } else {
             // someone else interned this hash first: make sure it is
@@ -768,8 +960,7 @@ impl UniqueStrStore {
                 if found != sid as u32 {
                     // a corrupt index value may also be out of bounds; this
                     // must be reported, not panic the validation itself
-                    let other: &str =
-                        store.get(found as usize).map_or("<out of bounds>", |b| b.as_ref());
+                    let other: &str = store.get(found as usize).unwrap_or("<out of bounds>");
                     errs.push(format!(
                         "index mismatch for str_id {sid} ('{s}'): hash 0x{key:x} -> {found} ('{other}')"
                     ));
@@ -1568,7 +1759,7 @@ the duplicate-insert path lock-free.
 */
 #[cfg(not(feature = "xxh128"))]
 #[inline]
-fn verify_hit(store: &[Box<str>], internal: u32, s: &str) {
+fn verify_hit(store: &StrArena, internal: u32, s: &str) {
     let stored: &str = &store[internal as usize];
     if stored != s {
         collision_panic(stored, s, internal);
@@ -1971,6 +2162,38 @@ mod tests {
     }
 
     #[test]
+    fn test_arena_chunk_boundaries_and_oversized() {
+        /*
+        Tiny chunks so strings straddle many chunk boundaries, plus strings
+        longer than a chunk, which get a dedicated allocation. Pointers
+        handed out before the arena grew must stay valid and identical.
+        */
+        let store: UniqueStrStore = UniqueStrStore::new_with_capacity(8, 16);
+        let strs: Vec<String> = (0..500).map(|i| format!("s{i}-{}", "x".repeat(i % 40))).collect();
+        let ids: Vec<u32> = strs.iter().map(|s| store.insert(s)).collect();
+        let early: StoredStrPtr = unsafe { store.get_ptr(ids[0]) };
+        let early_ref: &str = store.get(ids[0]).unwrap();
+
+        for (s, &id) in strs.iter().zip(&ids) {
+            assert_eq!(store.get(id).unwrap(), s);
+            assert_eq!(store.insert(s), id, "re-insert must dedup");
+        }
+        assert_eq!(store.len(), LATIN1_NUM as usize + strs.len());
+        assert_eq!(early.as_str(), strs[0]);
+        assert!(ptr::eq(early.as_str(), store.get(ids[0]).unwrap()), "pointer moved");
+        assert!(ptr::eq(early_ref, store.get(ids[0]).unwrap()), "reference moved");
+
+        // a string longer than any chunk, followed by more small ones
+        let big: String = "y".repeat(10_000);
+        let big_id: u32 = store.insert(&big);
+        let after: u32 = store.insert("after-the-big-one");
+        assert_eq!(store.get(big_id).unwrap(), big);
+        assert_eq!(store.get(after).unwrap(), "after-the-big-one");
+        assert_eq!(store.insert(&big), big_id);
+        store.validate_contents().ok();
+    }
+
+    #[test]
     fn test_hash_key_width() {
         // the `xxh128` feature is the only thing that changes the key type
         let expected: usize = if cfg!(feature = "xxh128") { 16 } else { 8 };
@@ -2016,7 +2239,7 @@ mod tests {
 
     #[test]
     fn test_unique_store_basic() {
-        let store: UniqueStrStore = UniqueStrStore::new_with_capacity(10);
+        let store: UniqueStrStore = UniqueStrStore::new_with_capacity(10, ARENA_CHUNK_SIZE);
         assert_eq!(store.len(), LATIN1_NUM as usize, "Store length should be {LATIN1_NUM}");
 
         let test = ["", " ", "a", "Z", "1", "2", "3", "/", ",", ")"];
@@ -2057,7 +2280,7 @@ mod tests {
     #[test]
     fn test_unique_store_shared() {
         let foo_s: &'static str = "foo";
-        let store: Arc<UniqueStrStore> = UniqueStrStore::new_with_capacity(10).shared();
+        let store: Arc<UniqueStrStore> = UniqueStrStore::new_with_capacity(10, ARENA_CHUNK_SIZE).shared();
         let stored: StoredStr = store.insert_or_get(HELLO);
         let start: u32 = LATIN1_NUM;
 
@@ -2107,7 +2330,7 @@ mod tests {
         use std::thread;
 
         let exp_len: usize = CONC_S_NUM + LATIN1_NUM as usize;
-        let store: UniqueStrStore = UniqueStrStore::new_with_capacity(exp_len);
+        let store: UniqueStrStore = UniqueStrStore::new_with_capacity(exp_len, ARENA_CHUNK_SIZE);
 
         let threads: Vec<_> = (0..CONC_T_NUM)
             .map(|t: usize| {
@@ -2136,7 +2359,7 @@ mod tests {
 
         let per_thread: usize = CONC_S_NUM / CONC_T_NUM;
         let exp_len: usize = per_thread + LATIN1_NUM as usize;
-        let store: UniqueStrStore = UniqueStrStore::new_with_capacity(exp_len);
+        let store: UniqueStrStore = UniqueStrStore::new_with_capacity(exp_len, ARENA_CHUNK_SIZE);
 
         let threads: Vec<_> = (0..CONC_T_NUM)
             .map(|_t| {

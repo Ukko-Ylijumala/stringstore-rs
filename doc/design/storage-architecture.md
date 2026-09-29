@@ -8,8 +8,9 @@
 
 ```text
 public index space:    0 ─────────────── 255 │ 256 ────────────── u32::MAX
-                       └── ascii Vec ───┘    │ └── store Vec (offset by 256) ──┘
-                       (fixed, no lock)      │ (RwLock<Vec<Box<str>>>)
+                       └── ascii Vec ───┘    │ └── store slots (offset by 256) ──┘
+                       (fixed, no lock)      │ (RwLock<StrArena>: Vec<*const str>
+                                             │  pointing into 128 KiB bump chunks)
 
 content lookup:        index: DashMap<HashKey xxh3 hash, u32 internal index, PreHashed>
                        (HashKey = u64, or u128 with the `xxh128` feature)
@@ -17,10 +18,34 @@ length:                len: AtomicU32  // public length, starts at 256
 ```
 
 1. **`ascii: Vec<Box<str>>`** — a fixed 256-entry vector populated once at construction with every ISO-8859-1 codepoint as a one-character `Box<str>`. The empty string `""` replaces `'\0'` at index 0, so a NUL string is *not* covered by this table: `return_iso8859_1_cp` rejects codepoint 0 and `"\0"` is interned through the regular hash-indexed path like any other content. Read access skips both the `RwLock` and the hash map entirely.
-2. **`store: RwLock<Vec<Box<str>>>`** — the actual interned strings. Internally indexed `0..N`, but every public-facing index is offset by `LATIN1_NUM` (256).
+2. **`store: RwLock<StrArena>`** — the actual interned strings. Internally indexed `0..N`, but every public-facing index is offset by `LATIN1_NUM` (256). `StrArena` is a `Vec<*const str>` of slots plus the chunked bump arena the slots point into; see "String bytes: the arena" below.
 3. **`index: DashMap<HashKey, u32, PreHashed>`** — content-to-position lookup, keyed by the xxh3 hash of the bytes (`HashKey` is `u64` by default, `u128` with the `xxh128` feature; see below). The stored value is the *internal* `store` index (pre-offset). `PreHashed` is an identity `BuildHasher`: the keys are already uniformly distributed 64-bit digests, so the map passes them straight through instead of running them through a second (streaming, 832-byte-state) Xxh3 pass per lookup. That second pass used to cost ~140 ns per map operation versus ~30 ns now; it is the single largest cost that was removed from `contains`/`idx`/`insert`.
 
 `len` is a `std::sync::atomic::AtomicU32` that holds the authoritative public length. It starts at 256 (the ASCII range is always "present"), and is incremented under the write lock in `insert_unchecked` only after a successful new insertion. The increment uses `Release` ordering and `len()` loads with `Acquire`, so observing the new length implies the corresponding push is visible.
+
+## String bytes: the arena
+
+`StrArena` copies each new string to the end of the current chunk, a `Box<[u8]>` of `chunk_size` bytes (`ARENA_CHUNK_SIZE` = 128 KiB by default, overridable per store through `new_with_capacity(capacity, chunk_size)`). When the string does not fit in what is left, a fresh chunk is started; the unused tail of the old one is wasted, bounded by one string length per chunk. A string longer than a whole chunk gets an exact-size chunk of its own in a separate `oversized` list, so the current chunk keeps filling. Chunks are never resized, moved or freed until the arena drops. The slot for each string is a fat pointer into its chunk, so a read is one load — identical cost to the old `Box<str>` deref.
+
+Why: one `malloc` per string was the dominant memory cost for short strings. glibc's smallest block is 32 bytes, so a 9-byte string cost 32 bytes of heap plus its 16-byte slot. Measured with 2M strings per row (500k for the long row), release build, glibc, resident-set growth including the slot vector:
+
+| average string | `Vec<Box<str>>` | arena | saved |
+|---|---|---|---|
+| 9 B (tokens) | 48.0 B/str | 25.4 B/str | 47 % |
+| 31 B (paths) | 64.1 B/str | 47.7 B/str | 26 % |
+| 150 B (lines) | 182.5 B/str | 167.8 B/str | 8 % |
+
+Build time for 2M short strings dropped from 68 ms to 28 ms (the `malloc` call left the write-lock critical section), and drop from 14 ms to 3 ms (a few hundred chunks to free instead of millions of blocks). The index map and the slot vector are untouched by this and still cost roughly 24 + 16 bytes per string, which is why the whole-store picture (same datasets, through `UniqueStrStore::insert`, v0.3.13 vs. the arena) shows smaller percentages:
+
+| average string | v0.3.13 | arena | `insert` ns/op | drop |
+|---|---|---|---|---|
+| 9 B | 88.2 B/str | 66.4 B/str (−25 %) | 165 → 124 | 18 → 8 ms |
+| 31 B | 104.1 B/str | 88.4 B/str (−15 %) | 188 → 156 | 20 → 15 ms |
+| 150 B | 222.8 B/str | 212.9 B/str (−4 %) | 222 → 221 | 14 → 11 ms |
+
+`get` is unchanged at ~9.5 ns/op on these 2M-string stores. Under an allocator with less per-block overhead than glibc (jemalloc, mimalloc) the memory saving shrinks toward the long-string row.
+
+`StrArena` holds raw pointers and is therefore `!Send + !Sync` by default; it carries explicit `unsafe impl`s, justified because every pointer targets bytes owned by a chunk in the same struct, written once before the pointer is published and freed only with the arena. Behind the `RwLock` this is no different from sharing a `Vec<Box<str>>`.
 
 ## The LATIN1_NUM offset
 
@@ -29,7 +54,7 @@ The constant `LATIN1_NUM = 256` is load-bearing. Any code touching indices must 
 | Space | Range | Where it appears |
 |---|---|---|
 | Public (offset applied) | `0..len()` | All `pub` method args and returns, `idx()`, `get()`, `borrow_str(idx)`, `StoredStr.0`, etc. |
-| Internal `store` | `0..store.len()` | DashMap values, the `idx` variable inside `insert_unchecked`, direct `store[i]` access in `reconstruct`. |
+| Internal `store` | `0..store.len()` | DashMap values, the `idx` variable inside `insert_unchecked`, direct `store[i]` (arena slot) access in `reconstruct`. |
 
 Translation points to watch:
 
