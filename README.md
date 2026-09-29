@@ -53,7 +53,7 @@ The crate pulls in a few git-pinned dependencies under the same author (`custom_
 ## Features
 
 - `size_of` *(off by default)* — implements `size_of::SizeOf` for `UniqueStrStore`, allowing memory footprint accounting. Requires the forked `size-of` git dependency.
-- `xxh128` *(off by default)* — 128-bit xxh3 index keys instead of 64-bit. Makes hash collisions negligible, so duplicate inserts skip the content check and the store read lock entirely, at the cost of doubling the per-entry size of the index map. The default 64-bit key with verification is the memory-efficient choice for regular use.
+- `xxh128` *(off by default)* — 128-bit xxh3 index keys instead of 64-bit. Makes hash collisions negligible, so duplicate inserts skip the content check (a read of the stored string), at the cost of doubling the per-entry size of the index map. The default 64-bit key with verification is the memory-efficient choice for regular use.
 
 ## Design
 

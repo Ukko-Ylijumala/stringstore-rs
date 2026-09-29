@@ -6,19 +6,21 @@ use custom_xxh3::hash_bytes;
 use xxhash_rust::xxh3::xxh3_128;
 use dashmap::{mapref::entry::Entry, DashMap};
 use miniutils::normalize_path;
-use parking_lot::RwLock;
+use parking_lot::Mutex;
 use std::{
+    alloc::{alloc_zeroed, dealloc, handle_alloc_error, Layout},
     cmp::Ordering,
     error::Error,
     fmt::{self, Debug, Display, Formatter},
     hash::{BuildHasher, Hash, Hasher},
+    hint,
     net::IpAddr, //Ipv4Addr, Ipv6Addr},
-    ops::{Deref, Index},
+    ops::Deref,
     path::{Path, PathBuf},
     ptr,
     str::{self, FromStr, Split},
     sync::{
-        atomic::{AtomicU32, Ordering as AtomicOrdering},
+        atomic::{AtomicPtr, AtomicU32, Ordering as AtomicOrdering},
         Arc,
     },
 };
@@ -44,17 +46,26 @@ requests to it. A bigger chunk saves nothing, and one over `isize::MAX`
 bytes cannot be allocated at all.
 */
 const MAX_ARENA_CHUNK_SIZE: usize = 1 << 30;
+/// log2 of the slot count of the first [SlotTable] segment (32 slots)
+const SLOT_SEG0_BITS: u32 = 5;
+/**
+Number of [SlotTable] segments. Segment `k` holds `32 << k` slots, so 27
+of them (`2^32 - 32` slots) cover all `MAX_USER_STRINGS` internal indices.
+*/
+const SLOT_SEGMENTS: usize = 32 - SLOT_SEG0_BITS as usize;
+/// Busy-wait rounds before a reader waiting on an in-flight copy blocks on the mutex.
+const SLOT_WAIT_SPINS: u32 = 64;
 
 /**
 The index key: an xxh3 digest of the string bytes.
 
 64 bits by default, which is the memory-efficient choice: a hash hit is
-verified against the stored contents (one read lock + one compare on the
-duplicate-insert path) so a collision panics instead of corrupting
-indices. The `xxh128` feature widens the key to 128 bits, which makes a
-collision negligible enough (~n²/2¹²⁹) that the verification is skipped
-and duplicate inserts never touch the store lock — at the cost of doubling
-the per-entry footprint of the index map. See
+verified against the stored contents (one lock-free slot read + one
+compare on the duplicate-insert path) so a collision panics instead of
+corrupting indices. The `xxh128` feature widens the key to 128 bits, which
+makes a collision negligible enough (~n²/2¹²⁹) that the verification is
+skipped and duplicate inserts never read the stored string — at the cost
+of doubling the per-entry footprint of the index map. See
 `doc/design/storage-architecture.md`.
 */
 #[cfg(not(feature = "xxh128"))]
@@ -79,9 +90,8 @@ in scenarios where many duplicate strings are used.
 - ISO-8859-1 codepoints: contained explicitly, at indices 1-255 (minus '\0').
 
 ## Design Considerations
-- Uses a [Vec] of fat pointers into arena chunks for string storage, which is
-  efficient for random access,
-  and should help with cache locality as well.
+- Uses a lock-free segmented table of fat pointers into arena chunks for
+  string storage, which is efficient for random access from any thread.
 - Uses a [DashMap] with `u64` Xxh3 string hashes as keys for fast lookups.
 - Custom [xxhash_rust] hasher ([CustomXxh3Hasher]) for potentially faster hashing.
 - Thread-safe.
@@ -141,27 +151,52 @@ store.validate_contents().expect("Store validation failed");
 #[derive(Clone)]
 pub struct UniqueStrStore(Arc<StoreInner>);
 
-/// Prints the public length and the arena (which lists every user string
-/// as `public index: "string"`); the ISO-8859-1 table and the raw hash
-/// index are left out, since neither is legible or informative.
+/// Prints the public length, the arena's shape and every user string as
+/// `public index: "string"`; the ISO-8859-1 table and the raw hash index
+/// are left out, since neither is legible or informative.
 impl Debug for UniqueStrStore {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        // the mutex freezes `len` while the strings are listed
+        let arena = self.0.store.lock();
         f.debug_struct("UniqueStrStore")
             .field("len", &self.len())
-            .field("store", &*self.0.store.read())
+            .field("arena", &*arena)
+            .field("strings", &StoreStrings(self))
             .finish()
     }
 }
 
+/// `Debug` helper: maps every user string from its *public* index
+/// without collecting anything. Only used with the store mutex held.
+struct StoreStrings<'a>(&'a UniqueStrStore);
+
+impl Debug for StoreStrings<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let store: &UniqueStrStore = self.0;
+        let entries = (LATIN1_NUM..store.len() as u32).map(|idx| (idx, store.slot(idx - LATIN1_NUM)));
+        f.debug_map().entries(entries).finish()
+    }
+}
+
 /**
-The shared state behind a [UniqueStrStore]. All four fields live behind
-one `Arc`: a `Clone` is a single refcount increment and every access goes
-through one pointer instead of four separately allocated ones.
+The shared state behind a [UniqueStrStore]. All fields live behind one
+`Arc`: a `Clone` is a single refcount increment and every access goes
+through one pointer instead of several separately allocated ones.
+
+Reads never lock. `store` is taken only by inserts and by whole-store
+walks (`Debug`, `validate_contents`, `SizeOf`); readers go through
+`slots`, gated by `len`. One index, `len` itself, can be published a
+moment before its string is copied; a reader that meets it waits for the
+copy (see `await_copy`).
 */
 struct StoreInner {
-    store: RwLock<StrArena>,
+    /// writer state: the arena chunks
+    store: Mutex<StrArena>,
+    /// one pointer per user string, readable without the lock
+    slots: SlotTable,
     index: DashMap<HashKey, u32, PreHashed>,
     ascii: Vec<Box<str>>,
+    /// public length: strings whose slot is written, incl. the ISO-8859-1 range
     len: AtomicU32,
 }
 
@@ -225,8 +260,9 @@ Append-only bump arena holding the bytes of every user-inserted string.
 
 Strings are copied back to back into fixed-size heap chunks that are
 never resized, moved or freed until the arena is dropped; a string longer
-than a chunk gets a dedicated chunk of exactly its own size. One fat
-pointer per string, in internal index order, lives in `slots`.
+than a chunk gets a dedicated chunk of exactly its own size. `push`
+returns the fat pointer to the copy; the store keeps it in its
+[SlotTable].
 
 Compared to one `Box<str>` per string this removes the allocator's
 per-allocation overhead (glibc's smallest block is 32 bytes, so a 9-byte
@@ -256,36 +292,26 @@ struct StrArena {
     /// bytes used in the last element of `chunks`
     cursor: usize,
     chunk_size: usize,
-    /// one pointer per interned string, in internal index order
-    slots: Vec<*const str>,
 }
 
 /*
-SAFETY: every chunk pointer is a unique allocation owned by this struct,
-and every pointer in `slots` addresses bytes inside one of those chunks.
-The bytes are written once, under `&mut self`, before the pointer is
-published, and are freed only when the whole arena drops.
-Sharing a `StrArena` across threads (behind the store's `RwLock`) is
+SAFETY: every chunk pointer is a unique allocation owned by this struct.
+String bytes are written once, under `&mut self`, before the pointer to
+them is handed out, and are freed only when the whole arena drops.
+Sharing a `StrArena` across threads (behind the store's mutex) is
 therefore no different from sharing a `Vec<Box<str>>`.
 */
 unsafe impl Send for StrArena {}
 unsafe impl Sync for StrArena {}
 
 impl StrArena {
-    fn with_capacity(slots: usize, chunk_size: usize) -> Self {
+    fn new(chunk_size: usize) -> Self {
         Self {
             chunks: Vec::new(),
             oversized: Vec::new(),
             cursor: 0,
             chunk_size: chunk_size.clamp(1, MAX_ARENA_CHUNK_SIZE),
-            slots: Vec::with_capacity(slots),
         }
-    }
-
-    /// Number of stored strings, which is also the next internal index.
-    #[inline]
-    fn len(&self) -> usize {
-        self.slots.len()
     }
 
     /// Whether an `n`-byte string (not an oversized one) needs a fresh chunk.
@@ -303,12 +329,11 @@ impl StrArena {
 
     /**
     Make room for one more string of `n` bytes. Every step of an append
-    that can fail (slot vector growth, a new chunk) runs here, so that the
-    `push` after it cannot unwind; see `push`. Reserving without pushing is
+    that can fail (`Vec` growth, a new chunk) runs here, so that the `push`
+    after it cannot unwind; see `push`. Reserving without pushing is
     harmless: room is only used up by `push`.
     */
     fn reserve(&mut self, n: usize) {
-        self.slots.reserve(1);
         if n > self.chunk_size {
             self.oversized.reserve(1);
         } else if self.needs_chunk(n) {
@@ -317,7 +342,7 @@ impl StrArena {
     }
 
     /**
-    Copy `s` into the arena and append its slot.
+    Copy `s` into the arena and return the pointer to the copy.
 
     After `reserve(s.len())` this neither grows a `Vec` nor allocates a
     chunk. The one allocation left is the exact-size chunk of an oversized
@@ -325,7 +350,7 @@ impl StrArena {
     so its layout is valid, and a failed allocation aborts. Without the
     reserve it still works, it just may allocate (and so fail) itself.
     */
-    fn push(&mut self, s: &str) {
+    fn push(&mut self, s: &str) -> *const str {
         let n: usize = s.len();
 
         if n > self.chunk_size {
@@ -333,8 +358,7 @@ impl StrArena {
             // whose bytes are a verbatim copy of a `&str` (valid UTF-8)
             let chunk: *mut [u8] = Box::into_raw(Box::<[u8]>::from(s.as_bytes()));
             self.oversized.push(chunk);
-            self.slots.push(chunk.cast_const() as *const str);
-            return;
+            return chunk.cast_const() as *const str;
         }
 
         if self.needs_chunk(n) {
@@ -345,9 +369,9 @@ impl StrArena {
         let base: *mut u8 = self.chunks.last().expect("a chunk was just ensured").cast::<u8>();
         /*
         SAFETY: `start + n <= chunk_size`, so the destination lies inside
-        the chunk, past every published slot. Only the raw pointer is
+        the chunk, past every string handed out. Only the raw pointer is
         used, so no reference to the chunk exists that could invalidate
-        those slots. The copied bytes come from a `&str`: valid UTF-8.
+        those strings. The copied bytes come from a `&str`: valid UTF-8.
         */
         let ptr: *const str = unsafe {
             let dst: *mut u8 = base.add(start);
@@ -355,36 +379,7 @@ impl StrArena {
             ptr::slice_from_raw_parts(dst.cast_const(), n) as *const str
         };
         self.cursor = start + n;
-        self.slots.push(ptr);
-    }
-
-    /// The string at internal index `i`, if it exists.
-    #[inline]
-    fn get(&self, i: usize) -> Option<&str> {
-        // SAFETY: see the struct-level invariant on `slots`
-        self.slots.get(i).map(|&p| unsafe { &*p })
-    }
-
-    /**
-    The string at internal index `i` without a bounds check.
-
-    # Safety
-    `i` must be `< self.len()`.
-    */
-    #[inline]
-    unsafe fn get_unchecked(&self, i: usize) -> &str {
-        &**self.slots.get_unchecked(i)
-    }
-
-    /// All stored strings in internal index order.
-    fn iter(&self) -> impl Iterator<Item = &str> {
-        // SAFETY: see the struct-level invariant on `slots`
-        self.slots.iter().map(|&p| unsafe { &*p })
-    }
-
-    /// Total bytes of string payload stored.
-    fn bytes_used(&self) -> usize {
-        self.iter().map(str::len).sum()
+        ptr
     }
 }
 
@@ -397,35 +392,13 @@ impl Drop for StrArena {
     }
 }
 
-impl Index<usize> for StrArena {
-    type Output = str;
-
-    #[inline]
-    fn index(&self, i: usize) -> &str {
-        self.get(i).expect("StrArena index out of bounds")
-    }
-}
-
-/// `Debug` helper: maps every arena string from its *public* index
-/// (`internal + LATIN1_NUM`) without collecting anything.
-struct StrArenaStrings<'a>(&'a StrArena);
-
-impl Debug for StrArenaStrings<'_> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        let entries = self.0.iter().enumerate().map(|(i, s)| (i as u32 + LATIN1_NUM, s));
-        f.debug_map().entries(entries).finish()
-    }
-}
-
 impl Debug for StrArena {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("StrArena")
-            .field("len", &self.slots.len())
             .field("chunks", &self.chunks.len())
             .field("oversized", &self.oversized.len())
             .field("chunk_size", &self.chunk_size)
-            .field("bytes_used", &self.bytes_used())
-            .field("strings", &StrArenaStrings(self))
+            .field("cursor", &self.cursor)
             .finish()
     }
 }
@@ -451,10 +424,135 @@ impl SizeOf for StrArena {
                     .add_distinct_allocation();
             }
         }
-        if self.slots.capacity() > 0 {
-            context
-                .add_vectorlike(self.slots.len(), self.slots.capacity(), size_of::<*const str>())
-                .add_distinct_allocation();
+    }
+}
+
+/**
+One `*const str` per user string, in internal index order, readable
+without any lock. Unlike a `Vec` it never moves a slot: it is a fixed
+array of segments of doubling size (`32 << k` slots in segment `k`),
+each allocated on first use and freed only on drop, so a reader can load
+a slot while a writer is adding more.
+
+Synchronization is by publication, not by the slots themselves: the
+single writer (holding the store mutex) writes each slot exactly once
+and only then Release-stores `len` past it; a reader loads a slot only
+after an Acquire load of `len` showed it, or after waiting out the
+insert that published it (see `await_copy`).
+*/
+struct SlotTable {
+    segments: [AtomicPtr<*const str>; SLOT_SEGMENTS],
+}
+
+impl SlotTable {
+    /// A table whose segments already cover the first `capacity` slots.
+    fn with_capacity(capacity: usize) -> Self {
+        let table: SlotTable = Self {
+            segments: [const { AtomicPtr::new(ptr::null_mut()) }; SLOT_SEGMENTS],
+        };
+        if capacity > 0 {
+            let last: u32 = capacity.min(MAX_USER_STRINGS) as u32 - 1;
+            for k in 0..=Self::locate(last).0 {
+                table.alloc_segment(k);
+            }
+        }
+        table
+    }
+
+    /// Segment number and offset within it of slot `i`.
+    #[inline]
+    fn locate(i: u32) -> (usize, usize) {
+        let j: usize = i as usize + (1 << SLOT_SEG0_BITS);
+        let top: u32 = usize::BITS - 1 - j.leading_zeros();
+        ((top - SLOT_SEG0_BITS) as usize, j - (1 << top))
+    }
+
+    /// Slot count of segment `k`.
+    #[inline]
+    fn segment_len(k: usize) -> usize {
+        1 << (k as u32 + SLOT_SEG0_BITS)
+    }
+
+    /// Memory layout of segment `k`.
+    fn segment_layout(k: usize) -> Layout {
+        Layout::array::<*const str>(Self::segment_len(k)).expect("slot segment size overflows isize")
+    }
+
+    /// Zeroed, so the pages of a large segment stay untouched until used
+    /// (like `Vec::with_capacity`); all-zero is a valid (null) raw pointer.
+    fn alloc_segment(&self, k: usize) {
+        let layout: Layout = Self::segment_layout(k);
+        // SAFETY: the layout is non-zero-sized; zeroed memory is valid `*const str`s
+        let seg: *mut *const str = unsafe { alloc_zeroed(layout) }.cast::<*const str>();
+        if seg.is_null() {
+            handle_alloc_error(layout);
+        }
+        self.segments[k].store(seg, AtomicOrdering::Release);
+    }
+
+    /**
+    Make sure slot `i` has a segment. May allocate, so it can fail: call
+    it before publishing anything about `i`.
+
+    # Safety
+    Only the holder of the store mutex may call `ensure` or `write`.
+    */
+    unsafe fn ensure(&self, i: u32) {
+        let k: usize = Self::locate(i).0;
+        if self.segments[k].load(AtomicOrdering::Relaxed).is_null() {
+            self.alloc_segment(k);
+        }
+    }
+
+    /**
+    Write slot `i`.
+
+    # Safety
+    The store mutex is held, `ensure(i)` ran, and slot `i` has never been
+    written (no reader can be looking at it yet).
+    */
+    #[inline]
+    unsafe fn write(&self, i: u32, s: *const str) {
+        let (k, off) = Self::locate(i);
+        self.segments[k].load(AtomicOrdering::Relaxed).add(off).write(s);
+    }
+
+    /**
+    Read slot `i`.
+
+    # Safety
+    Slot `i` was written, and this thread observed that through an
+    Acquire load of `len`, or of the index entry published after it.
+    */
+    #[inline]
+    unsafe fn read(&self, i: u32) -> *const str {
+        let (k, off) = Self::locate(i);
+        *self.segments[k].load(AtomicOrdering::Acquire).add(off)
+    }
+
+    #[cfg(feature = "size_of")]
+    fn size_of_children(&self, used: usize, context: &mut Context) {
+        let mut allocated: usize = 0;
+        for (k, seg) in self.segments.iter().enumerate() {
+            if !seg.load(AtomicOrdering::Relaxed).is_null() {
+                allocated += Self::segment_len(k);
+                context
+                    .add(Self::segment_len(k) * size_of::<*const str>())
+                    .add_distinct_allocation();
+            }
+        }
+        context.add_excess(allocated.saturating_sub(used) * size_of::<*const str>());
+    }
+}
+
+impl Drop for SlotTable {
+    fn drop(&mut self) {
+        for (k, seg) in self.segments.iter_mut().enumerate() {
+            let p: *mut *const str = *seg.get_mut();
+            if !p.is_null() {
+                // SAFETY: allocated by `alloc_segment` with this layout, freed only here
+                unsafe { dealloc(p.cast::<u8>(), Self::segment_layout(k)) };
+            }
         }
     }
 }
@@ -495,7 +593,8 @@ impl UniqueStrStore {
         latin1[0] = EMPTY_STR.into();
 
         UniqueStrStore(Arc::new(StoreInner {
-            store: RwLock::new(StrArena::with_capacity(capacity, chunk_size)),
+            store: Mutex::new(StrArena::new(chunk_size)),
+            slots: SlotTable::with_capacity(capacity),
             index: DashMap::with_capacity_and_hasher(capacity, PreHashed::default()),
             ascii: latin1,
             len: AtomicU32::new(LATIN1_NUM),
@@ -573,49 +672,114 @@ impl UniqueStrStore {
     }
 
     /// Get a reference to a stored string slice by its index, if it exists.
+    #[inline]
     pub fn get(&self, idx: u32) -> StringStoreResult<&str> {
-        match self.lookup(idx) {
-            Some(ptr) => unsafe { Ok(&*ptr) },
+        match self.resolve(idx) {
+            Some(s) => Ok(s),
+            // a tail call: keeps the hot path free of register saves
+            None => self.get_slow(idx),
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn get_slow(&self, idx: u32) -> StringStoreResult<&str> {
+        match self.resolve_past_len(idx) {
+            Some(s) => Ok(s),
             None => Err(StringStoreError::oob(idx, self.len() - 1)),
         }
     }
 
     /**
     Resolve a public index to a pointer at the stored [str], or `None` if
-    it is out of bounds. The store read lock is taken exactly once (and
-    not at all for the ISO-8859-1 range); every bounds-checked read path
-    (`get`, `borrow_str`) is built on this. See `get_str_ptr` for why the
-    pointer stays valid after the guard is released.
+    it is out of bounds. Takes no lock; every bounds-checked read path
+    (`get`, `borrow_str`, `reconstruct`) is built on this.
     */
     #[inline]
     fn lookup(&self, idx: u32) -> Option<*const str> {
+        self.resolve(idx).or_else(|| self.resolve_past_len(idx)).map(|s| s as *const str)
+    }
+
+    /// The fast half of `lookup`: every index below `len`. `None` for the
+    /// rest, which `resolve_past_len` settles.
+    #[inline]
+    fn resolve(&self, idx: u32) -> Option<&str> {
         if idx < LATIN1_NUM {
-            return Some(self.0.ascii[idx as usize].as_ref() as *const str);
+            return Some(&self.0.ascii[idx as usize]);
         }
-        let store = self.0.store.read();
-        store.get((idx - LATIN1_NUM) as usize).map(|s: &str| s as *const str)
+        if idx < self.0.len.load(AtomicOrdering::Acquire) {
+            // SAFETY: the Acquire load of `len` shows the slot written
+            return Some(unsafe { &*self.0.slots.read(idx - LATIN1_NUM) });
+        }
+        None
+    }
+
+    /**
+    The slow half of `lookup`, for `idx >= len` as last seen. `idx == len`
+    may be published and still being copied: only the mutex holder
+    inserts, one string at a time, so no other index can be. Spin only
+    while an insert is running; either way the mutex settles it, since any
+    published index is copied before the unlock. (A free mutex seen by a
+    plain load proves nothing: the insert may have finished after our
+    `len` load, without us seeing its store.)
+    */
+    #[cold]
+    #[inline(never)]
+    fn resolve_past_len(&self, idx: u32) -> Option<&str> {
+        if idx >= LATIN1_NUM && idx == self.0.len.load(AtomicOrdering::Acquire) {
+            if self.0.store.is_locked() {
+                self.await_copy(idx - LATIN1_NUM);
+            } else {
+                drop(self.0.store.lock());
+            }
+        }
+        // re-check: `len` may have passed `idx` since the caller looked
+        self.resolve(idx)
+    }
+
+    /**
+    The string at internal index `i`, which must be one the store handed
+    out (an index entry) or that a bounds check admitted. Takes no lock,
+    and may briefly wait for an in-flight copy (see `await_copy`).
+    */
+    #[inline]
+    fn slot(&self, i: u32) -> &str {
+        if i + LATIN1_NUM >= self.0.len.load(AtomicOrdering::Acquire) {
+            // published, so the copy is in flight: it ends before the unlock
+            self.await_copy(i);
+        }
+        // SAFETY: written and observed, per the contract above
+        unsafe { &*self.0.slots.read(i) }
+    }
+
+    /**
+    Wait out an insert that may be copying internal index `i`.
+    `insert_unchecked` publishes an index entry a moment before it copies
+    the string, all under the store mutex, so a reader that got the index
+    early spins briefly on `len`, then waits for the mutex. Returns once
+    `len` passes `i` or the insert that held the mutex has finished; the
+    caller re-checks `len` when the index may not have been published.
+    */
+    #[cold]
+    #[inline(never)]
+    fn await_copy(&self, i: u32) {
+        for _ in 0..SLOT_WAIT_SPINS {
+            if i + LATIN1_NUM < self.0.len.load(AtomicOrdering::Acquire) {
+                return;
+            }
+            hint::spin_loop();
+        }
+        // the copy ends before the mutex is released
+        drop(self.0.store.lock());
     }
 
     /**
     Get a raw pointer by index to a string slice in the store.
     Does no bounds checking apart from deciding whether to get the pointer
-    from the ISO-8859-1 range Vec, or from the store Vec.
-
-    ### Details
-    If we're going through a [RwLock], we need to do some extra pointer
-    magic, as returning a [Box::as_ref] directly would make the borrow
-    checker complain of "cannot return value referencing local variable".
+    from the ISO-8859-1 range Vec, or from the slot table.
 
     This is safe because we're returning a pointer to string bytes inside an
-    arena chunk, which never move, while the chunk pointers (and the slot
-    vector) may be moved around.
-
-    This should work too, but is more complicated:
-    ```ignore
-    let ptr: *const u8 = b.as_ptr();
-    let len: usize = b.len();
-    let bytes: &[u8] = core::slice::from_raw_parts(ptr, len);
-    std::str::from_utf8_unchecked(bytes)
+    arena chunk, which never move and are freed only with the store.
     */
     #[inline]
     unsafe fn get_str_ptr(&self, idx: u32) -> *const str {
@@ -623,8 +787,7 @@ impl UniqueStrStore {
         if idx < LATIN1_NUM {
             self.0.ascii[idx as usize].as_ref() as *const str
         } else {
-            let store = self.0.store.read();
-            store.get_unchecked((idx - LATIN1_NUM) as usize) as *const str
+            self.slot(idx - LATIN1_NUM) as *const str
         }
     }
 
@@ -632,9 +795,9 @@ impl UniqueStrStore {
     Borrow a raw reference to a stored [str]. For a safe alternative, use `get`.
 
     # Safety
-    Calling this method with an out-of-bounds index will panic. The returned
-    reference outlives the internal read lock; callers must uphold the
-    append-only contract (see `doc/design/unsafe-pointers.md`).
+    Calling this method with an out-of-bounds index will panic. Callers
+    must uphold the append-only contract (see
+    `doc/design/unsafe-pointers.md`).
     */
     #[inline]
     pub unsafe fn borrow_str(&self, idx: u32) -> &str {
@@ -660,16 +823,17 @@ impl UniqueStrStore {
     }
 
     /**
-    Insert a new string foregoing the first index check before write locking.
-    `key` must be the xxh3 hash of `s` (computed by the caller, so the
-    fast path and this slow path hash only once between them).
+    Insert a new string foregoing the first index check before taking the
+    store mutex. `key` must be the xxh3 hash of `s` (computed by the caller,
+    so the fast path and this slow path hash only once between them).
 
-    We still must check again after acquiring the write locks, as another
+    We still must check again after acquiring the mutex, as another
     thread might have gone behind our back in the meantime.
     */
     fn insert_unchecked(&self, s: &str, key: HashKey) -> StringStoreResult<u32> {
-        let mut store = self.0.store.write();
-        let len: usize = store.len();
+        let mut arena = self.0.store.lock();
+        // only the mutex holder moves `len`, so this is stable until we unlock
+        let len: usize = (self.0.len.load(AtomicOrdering::Relaxed) - LATIN1_NUM) as usize;
 
         /*
         Refuse inserts that would overflow the u32 public index space.
@@ -687,26 +851,27 @@ impl UniqueStrStore {
         let idx: u32 = len as u32;
 
         /*
-        Do everything that can fail (slot growth, a new chunk) before the
-        entry is published below. From then on nothing may unwind until the
-        push is done, or the entry would point at a slot that never gets
-        pushed. See `doc/design/concurrency.md` for why the entry is not
-        simply published after the push instead.
+        Do everything that can fail (a new chunk, a new slot segment)
+        before the entry is published below. From then on nothing may
+        unwind until the slot is written.
         */
-        store.reserve(s.len());
+        arena.reserve(s.len());
+        // SAFETY: we hold the store mutex
+        unsafe { self.0.slots.ensure(idx) };
 
         // atomic recheck: another thread may have interned this hash since
         // the caller's lookup
         match self.0.index.entry(key) {
             Entry::Vacant(vacant) => {
                 /*
-                Publish, then copy into the room reserved above. A reader
-                that finds the entry first still waits for the copy: every
-                slot read takes the store lock, which we hold until then.
+                Publish first, then copy. A reader that finds the entry
+                before `write_slot` releases `len` past it waits in
+                `await_copy`, at most until we unlock. (Copying first and
+                publishing last needs no waiting, but measured ~25 % slower
+                on fresh inserts; see `doc/design/concurrency.md`.)
                 */
                 vacant.insert(idx);
-                store.push(s);
-                self.0.len.fetch_add(1, AtomicOrdering::Release);
+                self.write_slot(&mut arena, idx, s);
                 Ok(idx + LATIN1_NUM)
             }
             Entry::Occupied(hit) => {
@@ -715,10 +880,19 @@ impl UniqueStrStore {
                 let indexed: u32 = *hit.get();
                 drop(hit);
                 #[cfg(not(feature = "xxh128"))]
-                verify_hit(&store, indexed, s);
+                verify_hit(self.slot(indexed), indexed, s);
                 Ok(indexed + LATIN1_NUM)
             }
         }
+    }
+
+    /// Copy `s` into the arena, write slot `idx`, and release `len` past it.
+    #[inline]
+    fn write_slot(&self, arena: &mut StrArena, idx: u32, s: &str) {
+        let ptr: *const str = arena.push(s);
+        // SAFETY: mutex held by our caller, `ensure(idx)` ran, slot is fresh
+        unsafe { self.0.slots.write(idx, ptr) };
+        self.0.len.store(idx + LATIN1_NUM + 1, AtomicOrdering::Release);
     }
 
     /// Core insert logic shared by `insert` and `try_insert`. Borrows only —
@@ -736,22 +910,18 @@ impl UniqueStrStore {
 
         /*
         For non-ASCII or multi-character strings. NOTE: copy the index
-        out of the DashMap guard before touching the store lock — holding
-        a shard guard while taking the store lock would invert the
-        store -> index lock order used by `insert_unchecked`.
+        out of the DashMap guard before reading the slot, so no shard
+        guard is held while `slot` might wait for an in-flight copy.
         */
         let key: HashKey = hash_key(s.as_bytes());
         if let Some(internal) = self.0.index.get(&key).map(|r| *r.value()) {
             /*
-            64-bit keys: verify the hit under the read lock. The slot is
-            guaranteed to exist, because the entry is only ever published
-            inside the write-lock critical section that also pushes the
-            string, so acquiring the read lock here means that section
-            has completed. 128-bit keys (`xxh128`): the hash is trusted
-            and this path never touches the store lock at all.
+            64-bit keys: verify the hit against the stored string, read
+            without any lock. 128-bit keys (`xxh128`): the hash is trusted
+            and the slot is not read at all.
             */
             #[cfg(not(feature = "xxh128"))]
-            verify_hit(&self.0.store.read(), internal, s);
+            verify_hit(self.slot(internal), internal, s);
             return Ok(internal + LATIN1_NUM);
         }
         self.insert_unchecked(s, key)
@@ -987,43 +1157,35 @@ impl UniqueStrStore {
         }
 
         // delimiter check
-        // we lock the store at this point so that the length is stable
-        let store = self.0.store.read();
-        let stored_num: u32 = self.len() as u32;
-        if delim >= stored_num {
+        let Some(delim_ptr) = self.lookup(delim) else {
             return Err(StringStoreError::IndexOutOfBounds {
                 idx: delim,
-                max: (stored_num - 1) as usize,
+                max: self.len() - 1,
             });
-        }
-
-        // resolve a public index while the read guard is held
-        let part = |idx: u32| -> &str {
-            match idx < LATIN1_NUM {
-                true => &self.0.ascii[idx as usize],
-                false => &store[(idx - LATIN1_NUM) as usize],
-            }
         };
-        let delim_str: &str = part(delim);
+        // SAFETY: `lookup` only returns pointers to stored strings
+        let delim_str: &str = unsafe { &*delim_ptr };
 
         /*
         Validate every index and size the output in one pass, so the
-        build pass below never reallocates. Index 0 is the empty string,
-        so it needs no special casing here or below.
+        build pass below never reallocates. No lock: the store only grows,
+        so an index valid here is still valid below. Index 0 is the empty
+        string, so it needs no special casing here or below.
         */
         let mut total: usize = delim_str.len() * (parts_num - 1);
         for (i, &idx) in indices.iter().enumerate() {
-            if idx >= stored_num {
+            match self.lookup(idx) {
+                Some(part) => total += unsafe { &*part }.len(),
                 // `max` is the highest valid index, like `IndexOutOfBounds`
-                return Err(StringStoreError::reconstruction(idx, i, stored_num - 1));
+                None => return Err(StringStoreError::reconstruction(idx, i, self.len() as u32 - 1)),
             }
-            total += part(idx).len();
         }
 
         // construct the string
         let mut result: String = String::with_capacity(total);
         for (i, &idx) in indices.iter().enumerate() {
-            result.push_str(part(idx));
+            let part: *const str = self.lookup(idx).expect("validated above");
+            result.push_str(unsafe { &*part });
             if i < parts_num - 1 {
                 // no delimiter after the last part
                 result.push_str(delim_str);
@@ -1043,45 +1205,45 @@ impl UniqueStrStore {
     Panics with the error list if any are found.
     */
     pub fn validate_contents(&self) -> Result<(), Vec<String>> {
-        // we want exclusive locks for validation to ensure consistency
-        let store = self.0.store.write();
+        // the mutex keeps inserts out, so `len` and the index hold still
+        let _arena = self.0.store.lock();
         let len: usize = self.len();
+        let l_store: usize = len - LATIN1_NUM as usize;
         let mut errs: Vec<String> = Vec::new();
 
-        let l_store: usize = store.len();
         let l_index: usize = self.0.index.len();
-        if l_store + LATIN1_NUM as usize != len {
-            errs.push(format!("store.len() ({l_store}) != stored length ({len})"));
-        };
         if l_store != l_index {
-            errs.push(format!("store.len() ({l_store}) != index.len() ({l_index})"));
+            errs.push(format!("stored strings ({l_store}) != index.len() ({l_index})"));
+        };
+
+        // a slot by internal index, or None past the stored length
+        // SAFETY: every slot below `len` is written; the mutex orders us after it
+        let stored = |sid: usize| -> Option<&str> {
+            (sid < l_store).then(|| unsafe { &*self.0.slots.read(sid as u32) })
         };
 
         // Check that each store entry has a corresponding index.
-        for (sid, s) in store.iter().enumerate() {
+        for sid in 0..l_store {
+            let s: &str = stored(sid).expect("below the stored length");
             let key: HashKey = hash_key(s.as_bytes());
-            if !self.0.index.contains_key(&key) {
-                errs.push(format!("missing hash: 0x{key:x} (str_id: {sid}, str: '{s}')"));
-            } else {
-                let found: u32 = *self.0.index.get(&key).unwrap();
-                if found != sid as u32 {
+            match self.0.index.get(&key).map(|r| *r.value()) {
+                None => errs.push(format!("missing hash: 0x{key:x} (str_id: {sid}, str: '{s}')")),
+                Some(found) if found != sid as u32 => {
                     // a corrupt index value may also be out of bounds; this
                     // must be reported, not panic the validation itself
-                    let other: &str = store.get(found as usize).unwrap_or("<out of bounds>");
+                    let other: &str = stored(found as usize).unwrap_or("<out of bounds>");
                     errs.push(format!(
                         "index mismatch for str_id {sid} ('{s}'): hash 0x{key:x} -> {found} ('{other}')"
                     ));
                 }
+                Some(_) => {}
             }
         }
 
         // Check that each index is valid wrt. the store.
         for itm in self.0.index.iter() {
             let (key, sid) = itm.pair();
-            // safe lookup: an out-of-bounds index used to fall through to a
-            // `get_unchecked` here, which is UB — exactly when validation
-            // has found something worth reporting
-            let s: &str = match store.get(*sid as usize) {
+            let s: &str = match stored(*sid as usize) {
                 Some(s) => s,
                 None => {
                     errs.push(format!("index out of bounds: {sid} >= {l_store} (hash: 0x{key:x})"));
@@ -1109,11 +1271,12 @@ impl UniqueStrStore {
 }
 
 // We have to implement our own since `size_of::SizeOf` does not support
-// `RwLock` nor `DashMap`.
+// `Mutex` nor `DashMap`.
 #[cfg(feature = "size_of")]
 impl SizeOf for UniqueStrStore {
     fn size_of_children(&self, context: &mut Context) {
-        self.0.store.read().size_of_children(context);
+        self.0.store.lock().size_of_children(context);
+        self.0.slots.size_of_children(self.len() - LATIN1_NUM as usize, context);
         self.0.ascii.size_of_children(context);
 
         if self.0.index.capacity() > 0 {
@@ -2067,8 +2230,7 @@ the duplicate-insert path lock-free.
 */
 #[cfg(not(feature = "xxh128"))]
 #[inline]
-fn verify_hit(store: &StrArena, internal: u32, s: &str) {
-    let stored: &str = &store[internal as usize];
+fn verify_hit(stored: &str, internal: u32, s: &str) {
     if stored != s {
         collision_panic(stored, s, internal);
     }
@@ -2194,7 +2356,11 @@ impl StringStoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::panic::{catch_unwind, AssertUnwindSafe};
+    use std::{
+        hint,
+        panic::{catch_unwind, AssertUnwindSafe},
+        thread,
+    };
 
     const HELLO: &str = "Hello, world!";
     const CONC_S_NUM: usize = 100_000;
@@ -2514,7 +2680,7 @@ mod tests {
         the constructor's clamp to force the panic.
         */
         let store: UniqueStrStore = UniqueStrStore::new();
-        store.0.store.write().chunk_size = usize::MAX;
+        store.0.store.lock().chunk_size = usize::MAX;
         let res = catch_unwind(AssertUnwindSafe(|| store.insert(HELLO)));
         assert!(res.is_err(), "the chunk allocation should have panicked");
 
@@ -2524,7 +2690,7 @@ mod tests {
         store.validate_contents().ok();
 
         // the store stays usable
-        store.0.store.write().chunk_size = ARENA_CHUNK_SIZE;
+        store.0.store.lock().chunk_size = ARENA_CHUNK_SIZE;
         assert_eq!(store.insert(HELLO), LATIN1_NUM);
         assert_eq!(store.get_ref(HELLO).unwrap(), HELLO);
         store.validate_contents().ok();
@@ -2534,23 +2700,92 @@ mod tests {
     fn test_reserve_front_loads_allocation() {
         // after `reserve`, `push` must not grow a Vec or start a chunk:
         // it runs while the index entry is already published
-        let mut arena: StrArena = StrArena::with_capacity(0, 16);
+        let mut arena: StrArena = StrArena::new(16);
         let strs: [&str; 5] = ["abc", "defghijklmno", "pqrs", "an oversized string", "t"];
+        let mut ptrs: Vec<*const str> = Vec::new();
         for s in strs {
             arena.reserve(s.len());
-            let before = (arena.chunks.len(), arena.slots.capacity(), arena.oversized.capacity());
-            arena.push(s);
-            let after = (arena.chunks.len(), arena.slots.capacity(), arena.oversized.capacity());
+            let before = (arena.chunks.len(), arena.oversized.capacity());
+            ptrs.push(arena.push(s));
+            let after = (arena.chunks.len(), arena.oversized.capacity());
             assert_eq!(before, after, "push of {s:?} allocated after reserve");
         }
-        assert_eq!(arena.iter().collect::<Vec<&str>>(), strs);
+        let got: Vec<&str> = ptrs.iter().map(|&p| unsafe { &*p }).collect();
+        assert_eq!(got, strs);
         assert_eq!(arena.oversized.len(), 1);
+    }
+
+    #[test]
+    fn test_slot_table_layout() {
+        // segment k holds 32 << k slots, back to back in index order
+        assert_eq!(SlotTable::locate(0), (0, 0));
+        assert_eq!(SlotTable::locate(31), (0, 31));
+        assert_eq!(SlotTable::locate(32), (1, 0));
+        assert_eq!(SlotTable::locate(95), (1, 63));
+        assert_eq!(SlotTable::locate(96), (2, 0));
+        let (k, off) = SlotTable::locate(MAX_USER_STRINGS as u32 - 1);
+        assert_eq!(k, SLOT_SEGMENTS - 1, "the last index must need exactly the last segment");
+        assert!(off < SlotTable::segment_len(k));
+
+        // round trip across segment boundaries
+        let table: SlotTable = SlotTable::with_capacity(0);
+        let strs: Vec<String> = (0..200).map(|i| format!("s{i}")).collect();
+        for (i, s) in strs.iter().enumerate() {
+            unsafe {
+                table.ensure(i as u32);
+                table.write(i as u32, s.as_str());
+            }
+        }
+        for (i, s) in strs.iter().enumerate() {
+            assert_eq!(unsafe { &*table.read(i as u32) }, s);
+        }
+    }
+
+    #[test]
+    fn test_reader_follows_writer() {
+        /*
+        Readers chase a writer: each spins on `idx` until the next string
+        appears, then reads it back through every read path. Inserts
+        publish the entry before the copy lands; the reads must wait for
+        it, not fail or read an unwritten slot.
+        */
+        // Miri interprets every spin; a few hundred rounds still interleave
+        const N: usize = if cfg!(miri) { 300 } else { 20_000 };
+        let store: UniqueStrStore = UniqueStrStore::new();
+        let writer = {
+            let store = store.clone();
+            thread::spawn(move || (0..N).for_each(|i| _ = store.insert(format!("follow-{i}"))))
+        };
+        let readers: Vec<_> = (0..3)
+            .map(|_| {
+                let store = store.clone();
+                thread::spawn(move || {
+                    for i in 0..N {
+                        let s: String = format!("follow-{i}");
+                        let idx: u32 = loop {
+                            match store.idx(&s) {
+                                Some(idx) => break idx,
+                                None => hint::spin_loop(),
+                            }
+                        };
+                        assert_eq!(store.get(idx).unwrap(), s);
+                        assert_eq!(store.get_ref(&s).unwrap(), s.as_str());
+                        assert_eq!(store.insert(&s), idx);
+                    }
+                })
+            })
+            .collect();
+        writer.join().unwrap();
+        for r in readers {
+            r.join().unwrap();
+        }
+        store.validate_contents().ok();
     }
 
     #[test]
     fn test_chunk_size_is_clamped() {
         // an unallocatable chunk size used to panic on the first insert
-        let chunk = |size: usize| UniqueStrStore::new_with_capacity(1, size).0.store.read().chunk_size;
+        let chunk = |size: usize| UniqueStrStore::new_with_capacity(1, size).0.store.lock().chunk_size;
         assert_eq!(chunk(0), 1);
         assert_eq!(chunk(ARENA_CHUNK_SIZE), ARENA_CHUNK_SIZE);
         assert_eq!(chunk(usize::MAX), MAX_ARENA_CHUNK_SIZE);

@@ -16,8 +16,8 @@ rust-version = "1.87"
 [features]
 #default = ["size_of"]
 size_of = ["dep:size-of"]
-# 128-bit xxh3 index keys: duplicate inserts skip the content check and the
-# store read lock, at twice the per-entry index footprint. See `HashKey`.
+# 128-bit xxh3 index keys: duplicate inserts skip the content check, at
+# twice the per-entry index footprint. See `HashKey`.
 xxh128 = ["dep:xxhash-rust"]
 
 [dependencies]

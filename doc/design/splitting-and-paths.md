@@ -52,7 +52,7 @@ The delimiter is always `/` (the constant `PATH_SEP`). `store_path` does not ret
 - `InvalidReconstruction { idx, pos, max }` — a part index at position `pos` is out of range.
 - `ReconstructionTooLarge` — the input vector has more than `u32::MAX` entries (defensive; not reachable from a single `Vec<u32>` on any real machine).
 
-The function takes the `store` **read lock** for the duration of the rebuild and snapshots `len()` under it, so concurrent inserts cannot make a previously-valid index look out-of-range during reconstruction.
+The function takes no lock. The store only grows, so an index that passes the validation pass is still valid in the build pass, however many inserts run concurrently; an index that a concurrent insert has just published is waited for rather than reported out of range (see `concurrency.md`).
 
 ## Edge cases worth knowing
 

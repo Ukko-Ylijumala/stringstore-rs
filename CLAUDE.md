@@ -12,7 +12,7 @@ Standard Cargo workflow. The crate is `publish = false` and intended for consump
 - Test with the optional memory-accounting feature: `cargo test --features size_of`
 - Test with 128-bit index keys: `cargo test --features xxh128` (the full matrix is `""`, `xxh128`, `size_of`, `xxh128,size_of`; clippy the same way)
 - Lint: `cargo clippy --all-targets`
-- Unsafe check: `cargo +nightly miri test -- --skip test_concurrent_inserts --skip test_competing_inserts` (needs the nightly `miri` component; slow). Required after touching `StrArena` or the insert path; see `doc/design/unsafe-pointers.md`.
+- Unsafe check: `cargo +nightly miri test -- --skip test_concurrent_inserts --skip test_competing_inserts` (needs the nightly `miri` component; slow). Required after touching `StrArena`, `SlotTable`, or the insert or read paths; see `doc/design/unsafe-pointers.md`.
 
 Tests live inline at the bottom of `src/lib.rs` under `mod tests` — there is no `tests/` directory.
 
@@ -23,7 +23,7 @@ Single-file library crate. All public and internal types are in `src/lib.rs`. Ro
 | Lines (approx.) | Contents |
 |---|---|
 | `UniqueStrStore` and its impl | The main interner type and every public method |
-| `StoreInner`, `PreHashed`, `StrArena` | The shared state behind the `Arc`, the identity hasher for the index, and the chunked bump arena holding string bytes (`ARENA_CHUNK_SIZE` default, per-store override via `new_with_capacity`) |
+| `StoreInner`, `PreHashed`, `StrArena`, `SlotTable` | The shared state behind the `Arc`, the identity hasher for the index, the chunked bump arena holding string bytes (`ARENA_CHUNK_SIZE` default, per-store override via `new_with_capacity`), and the lock-free slot table readers use |
 | `StoredStrPtr` | Raw-pointer handle to an interned string (unsafe lifetime) |
 | `StoredStr<'a>` | Safe lifetime-tracked handle |
 | `CompactStr`, `Character`, `TextElement`, `StructuredLine`, `Hex`, `HexFormat`, `Integer` | **Dormant scaffolding** for a structured-text feature; not exported, not tested |
@@ -37,7 +37,7 @@ Single-file library crate. All public and internal types are in `src/lib.rs`. Ro
 The design of the non-obvious bits lives in [`doc/design/`](doc/design/README.md). Read the relevant doc before changing behavior in that area — each calls out invariants that the type system does not enforce.
 
 - **[Storage architecture](doc/design/storage-architecture.md)** — the three-container split (`ascii` + `store` + `index`), the arena that holds the string bytes, and the load-bearing `LATIN1_NUM = 256` offset between public and internal indices. Required reading before touching anything index-related.
-- **[Concurrency model](doc/design/concurrency.md)** — RwLock + DashMap lock ordering and the post-lock recheck in `insert_unchecked`. Required reading before changing the insert path.
+- **[Concurrency model](doc/design/concurrency.md)** — lock-free reads over the slot table, the writer mutex + DashMap lock ordering, the post-lock recheck in `insert_unchecked`, and the one in-flight index readers may have to wait for. Required reading before changing the insert or read paths.
 - **[Unsafe pointer surface](doc/design/unsafe-pointers.md)** — `borrow_str`, `StoredStrPtr`, and the append-only invariant that keeps them sound. Required reading before adding any removal/mutation API.
 - **[Tokenization](doc/design/tokenization.md)** — the byte-class scanner, its leftmost-first contract, why byte-wise stepping is UTF-8 safe, the empty-delimiter footgun, and where richer tokenization rules should plug in.
 - **[Splitting and paths](doc/design/splitting-and-paths.md)** — sentinel-zero encoding shared by `split_and_store`, `store_path`, and `reconstruct`.
@@ -55,7 +55,7 @@ Four dependencies are git-pinned to forks under `Ukko-Ylijumala`:
 
 The `xxh128` feature (off by default) switches the index key `HashKey` from `u64` to `u128` and compiles out the duplicate-insert content check (`verify_hit`, `collision_panic`); every hashing site goes through `hash_key`, so the two builds differ only there. Doubles the index map's per-entry footprint, which is why it is opt-in. See `doc/design/storage-architecture.md`.
 
-The `size_of` feature is currently *off* by default (the `default = ["size_of"]` line in `Cargo.toml` is commented out). The `SizeOf for UniqueStrStore` impl is hand-rolled because `size_of` does not natively support `RwLock` or `DashMap`.
+The `size_of` feature is currently *off* by default (the `default = ["size_of"]` line in `Cargo.toml` is commented out). The `SizeOf for UniqueStrStore` impl is hand-rolled because `size_of` does not natively support `Mutex` or `DashMap`.
 
 ## Dormant scaffolding — do not assume final
 

@@ -4,8 +4,8 @@ Per-feature design documentation for the `stringstore` crate. Each file is self-
 
 | Doc | Covers |
 |---|---|
-| [storage-architecture.md](storage-architecture.md) | The three-container layout (`ascii` + `store` + `index`) and the `LATIN1_NUM = 256` offset that hides the seam |
-| [concurrency.md](concurrency.md) | Lock ordering, the post-lock recheck in `insert_unchecked`, `validate_contents` semantics |
+| [storage-architecture.md](storage-architecture.md) | The three-container layout (`ascii` + slot table and arena + `index`), the `LATIN1_NUM = 256` offset that hides the seam, and the `xxh128` trade-off |
+| [concurrency.md](concurrency.md) | Lock-free reads, the one in-flight index, lock ordering, the post-lock recheck in `insert_unchecked`, `validate_contents` semantics |
 | [unsafe-pointers.md](unsafe-pointers.md) | `borrow_str`, `StoredStrPtr`, and the append-only invariant that makes them sound |
 | [tokenization.md](tokenization.md) | `tokenize` vs `tokenize_regex`, the dispatch heuristic, known divergence cases |
 | [splitting-and-paths.md](splitting-and-paths.md) | Sentinel-zero encoding shared by `split_and_store`, `store_path`, and `reconstruct` |
