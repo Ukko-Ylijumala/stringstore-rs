@@ -1,6 +1,6 @@
 // Copyright (c) 2024-2026 Mikko Tanner. All rights reserved.
 
-use custom_xxh3::{hash_bytes, CustomXxh3Hasher};
+use custom_xxh3::hash_bytes;
 use dashmap::DashMap;
 use miniutils::normalize_path;
 use parking_lot::RwLock;
@@ -108,11 +108,68 @@ assert_eq!(unsafe { store.borrow_str(foo_id) }, "foo");
 store.validate_contents().expect("Store validation failed");
 */
 #[derive(Debug, Clone)]
-pub struct UniqueStrStore {
-    store: Arc<RwLock<Vec<Box<str>>>>,
-    index: Arc<DashMap<u64, u32, CustomXxh3Hasher>>,
-    ascii: Arc<Vec<Box<str>>>,
-    len: Arc<AtomicU32>,
+pub struct UniqueStrStore(Arc<StoreInner>);
+
+/**
+The shared state behind a [UniqueStrStore]. All four fields live behind
+one `Arc`: a `Clone` is a single refcount increment and every access goes
+through one pointer instead of four separately allocated ones.
+*/
+#[derive(Debug)]
+struct StoreInner {
+    store: RwLock<Vec<Box<str>>>,
+    index: DashMap<u64, u32, PreHashed>,
+    ascii: Vec<Box<str>>,
+    len: AtomicU32,
+}
+
+/**
+[BuildHasher] for the index map, whose keys are already 64-bit xxh3
+digests of the string bytes. Re-hashing them through a full Xxh3 state
+(832 bytes, rebuilt on every lookup) cost ~140 ns per map operation;
+passing the key straight through costs ~30 ns.
+
+This is sound because xxh3 output is uniformly distributed across all 64
+bits, which is what [DashMap]'s shard selection (high bits) and
+hashbrown's control bytes / bucket index (top 7 bits, low bits) rely on.
+`write` exists only to satisfy the trait; the map never hashes anything
+but a `u64`.
+*/
+#[derive(Clone, Copy, Default)]
+struct PreHashed(u64);
+
+impl Hasher for PreHashed {
+    #[inline]
+    fn write_u64(&mut self, key: u64) {
+        self.0 = key;
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for chunk in bytes.chunks(8) {
+            let mut b: [u8; 8] = [0; 8];
+            b[..chunk.len()].copy_from_slice(chunk);
+            self.0 = self.0.rotate_left(5) ^ u64::from_le_bytes(b);
+        }
+    }
+
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+impl BuildHasher for PreHashed {
+    type Hasher = PreHashed;
+
+    #[inline]
+    fn build_hasher(&self) -> PreHashed {
+        PreHashed(0)
+    }
+}
+
+#[cfg(feature = "size_of")]
+impl SizeOf for PreHashed {
+    fn size_of_children(&self, _context: &mut Context) {}
 }
 
 // The derived `Default` would bypass `new()` and produce a store with an
@@ -141,16 +198,12 @@ impl UniqueStrStore {
         // replace the null string ('\0') with an empty string
         latin1[0] = EMPTY_STR.into();
 
-        UniqueStrStore {
-            store: RwLock::new(Vec::with_capacity(capacity)).into(),
-            index: DashMap::with_capacity_and_hasher(
-                capacity,
-                CustomXxh3Hasher::default().build_hasher(),
-            )
-            .into(),
-            ascii: latin1.into(),
-            len: AtomicU32::new(LATIN1_NUM).into(),
-        }
+        UniqueStrStore(Arc::new(StoreInner {
+            store: RwLock::new(Vec::with_capacity(capacity)),
+            index: DashMap::with_capacity_and_hasher(capacity, PreHashed::default()),
+            ascii: latin1,
+            len: AtomicU32::new(LATIN1_NUM),
+        }))
     }
 
     /// Put this [UniqueStrStore] into an [Arc].
@@ -166,7 +219,7 @@ impl UniqueStrStore {
     */
     #[inline]
     pub fn len(&self) -> usize {
-        self.len.load(AtomicOrdering::Acquire) as usize
+        self.0.len.load(AtomicOrdering::Acquire) as usize
     }
 
     /// Always false: indices 0-255 (the ISO-8859-1 codepoints) are populated
@@ -196,7 +249,7 @@ impl UniqueStrStore {
             return true;
         }
 
-        self.index.contains_key(&hash_bytes(s.as_bytes()))
+        self.0.index.contains_key(&hash_bytes(s.as_bytes()))
     }
 
     /**
@@ -217,18 +270,33 @@ impl UniqueStrStore {
             }
         }
 
-        self.index
+        self.0.index
             .get(&hash_bytes(s.as_bytes()))
             .map(|r| r.value() + LATIN1_NUM)
     }
 
     /// Get a reference to a stored string slice by its index, if it exists.
     pub fn get(&self, idx: u32) -> StringStoreResult<&str> {
-        let len: usize = self.len();
-        if idx as usize >= len {
-            return Err(StringStoreError::oob(idx, len - 1));
+        match self.lookup(idx) {
+            Some(ptr) => unsafe { Ok(&*ptr) },
+            None => Err(StringStoreError::oob(idx, self.len() - 1)),
         }
-        unsafe { Ok(self.borrow_str(idx)) }
+    }
+
+    /**
+    Resolve a public index to a pointer at the stored [str], or `None` if
+    it is out of bounds. The store read lock is taken exactly once (and
+    not at all for the ISO-8859-1 range); every bounds-checked read path
+    (`get`, `borrow_str`) is built on this. See `get_str_ptr` for why the
+    pointer stays valid after the guard is released.
+    */
+    #[inline]
+    fn lookup(&self, idx: u32) -> Option<*const str> {
+        if idx < LATIN1_NUM {
+            return Some(self.0.ascii[idx as usize].as_ref() as *const str);
+        }
+        let store = self.0.store.read();
+        store.get((idx - LATIN1_NUM) as usize).map(|b| &**b as *const str)
     }
 
     /**
@@ -255,9 +323,9 @@ impl UniqueStrStore {
     unsafe fn get_str_ptr(&self, idx: u32) -> *const str {
         // ISO-8859-1 range
         if idx < LATIN1_NUM {
-            self.ascii[idx as usize].as_ref() as *const str
+            self.0.ascii[idx as usize].as_ref() as *const str
         } else {
-            let store = self.store.read();
+            let store = self.0.store.read();
             store.get_unchecked((idx - LATIN1_NUM) as usize).as_ref() as *const str
         }
     }
@@ -272,11 +340,9 @@ impl UniqueStrStore {
     */
     #[inline]
     pub unsafe fn borrow_str(&self, idx: u32) -> &str {
-        if idx >= LATIN1_NUM && (idx - LATIN1_NUM) as usize >= self.store.read().len() {
-            panic!("Store index {idx} out of bounds (max: {})", self.len() - 1);
-        } else {
-            let ptr: *const str = self.get_str_ptr(idx);
-            &*ptr
+        match self.lookup(idx) {
+            Some(ptr) => &*ptr,
+            None => panic!("Store index {idx} out of bounds (max: {})", self.len() - 1),
         }
     }
 
@@ -304,7 +370,7 @@ impl UniqueStrStore {
     thread might have gone behind our back in the meantime.
     */
     fn insert_unchecked(&self, s: &str, key: u64) -> StringStoreResult<u32> {
-        let mut store = self.store.write();
+        let mut store = self.0.store.write();
         let len: usize = store.len();
 
         /*
@@ -323,12 +389,12 @@ impl UniqueStrStore {
         let idx: u32 = len as u32;
 
         // atomic get or insert
-        let indexed: u32 = *self.index.entry(key).or_insert(idx);
+        let indexed: u32 = *self.0.index.entry(key).or_insert(idx);
         if indexed == idx {
             // we did in fact insert a new string; this `Box<str>` is the
             // only allocation on the entire insert path
             store.push(s.into());
-            self.len.fetch_add(1, AtomicOrdering::Release);
+            self.0.len.fetch_add(1, AtomicOrdering::Release);
         } else {
             // someone else interned this hash first: make sure it is
             // actually the same string and not a 64-bit hash collision
@@ -360,14 +426,14 @@ impl UniqueStrStore {
         store -> index lock order used by `insert_unchecked`.
         */
         let key: u64 = hash_bytes(s.as_bytes());
-        if let Some(internal) = self.index.get(&key).map(|r| *r.value()) {
+        if let Some(internal) = self.0.index.get(&key).map(|r| *r.value()) {
             /*
             The slot is guaranteed to exist: the entry is only ever
             published inside the write-lock critical section that also
             pushes the string, so acquiring the read lock here means
             that section has completed.
             */
-            let store = self.store.read();
+            let store = self.0.store.read();
             let stored: &str = &store[internal as usize];
             if stored != s {
                 collision_panic(stored, s, internal);
@@ -614,7 +680,7 @@ impl UniqueStrStore {
 
         // delimiter check
         // we lock the store at this point so that the length is stable
-        let store = self.store.read();
+        let store = self.0.store.read();
         let stored_num: u32 = self.len() as u32;
         if delim >= stored_num {
             return Err(StringStoreError::IndexOutOfBounds {
@@ -623,27 +689,33 @@ impl UniqueStrStore {
             });
         }
 
-        // get the delimiter string
-        let delim_str: &str = match delim < LATIN1_NUM {
-            true => &self.ascii[delim as usize],
-            false => &store[(delim - LATIN1_NUM) as usize],
+        // resolve a public index while the read guard is held
+        let part = |idx: u32| -> &str {
+            match idx < LATIN1_NUM {
+                true => &self.0.ascii[idx as usize],
+                false => &store[(idx - LATIN1_NUM) as usize],
+            }
         };
+        let delim_str: &str = part(delim);
+
+        /*
+        Validate every index and size the output in one pass, so the
+        build pass below never reallocates. Index 0 is the empty string,
+        so it needs no special casing here or below.
+        */
+        let mut total: usize = delim_str.len() * (parts_num - 1);
+        for (i, &idx) in indices.iter().enumerate() {
+            if idx >= stored_num {
+                // `max` is the highest valid index, like `IndexOutOfBounds`
+                return Err(StringStoreError::reconstruction(idx, i, stored_num - 1));
+            }
+            total += part(idx).len();
+        }
 
         // construct the string
-        let mut result: String = String::new();
-        for (i, idx) in indices.iter().enumerate() {
-            if idx >= &stored_num {
-                // `max` is the highest valid index, like `IndexOutOfBounds`
-                return Err(StringStoreError::reconstruction(*idx, i, stored_num - 1));
-            }
-
-            if idx != &0 {
-                result.push_str(match idx < &LATIN1_NUM {
-                    true => &self.ascii[*idx as usize],
-                    false => &store[(*idx - LATIN1_NUM) as usize],
-                });
-            }
-
+        let mut result: String = String::with_capacity(total);
+        for (i, &idx) in indices.iter().enumerate() {
+            result.push_str(part(idx));
             if i < parts_num - 1 {
                 // no delimiter after the last part
                 result.push_str(delim_str);
@@ -664,12 +736,12 @@ impl UniqueStrStore {
     */
     pub fn validate_contents(&self) -> Result<(), Vec<String>> {
         // we want exclusive locks for validation to ensure consistency
-        let store = self.store.write();
+        let store = self.0.store.write();
         let len: usize = self.len();
         let mut errs: Vec<String> = Vec::new();
 
         let l_store: usize = store.len();
-        let l_index: usize = self.index.len();
+        let l_index: usize = self.0.index.len();
         if l_store + LATIN1_NUM as usize != len {
             errs.push(format!("store.len() ({l_store}) != stored length ({len})"));
         };
@@ -680,10 +752,10 @@ impl UniqueStrStore {
         // Check that each store entry has a corresponding index.
         for (sid, s) in store.iter().enumerate() {
             let key: u64 = hash_bytes(s.as_bytes());
-            if !self.index.contains_key(&key) {
+            if !self.0.index.contains_key(&key) {
                 errs.push(format!("missing hash: 0x{key:x} (str_id: {sid}, str: '{s}')"));
             } else {
-                let found: u32 = *self.index.get(&key).unwrap();
+                let found: u32 = *self.0.index.get(&key).unwrap();
                 if found != sid as u32 {
                     // a corrupt index value may also be out of bounds; this
                     // must be reported, not panic the validation itself
@@ -697,7 +769,7 @@ impl UniqueStrStore {
         }
 
         // Check that each index is valid wrt. the store.
-        for itm in self.index.iter() {
+        for itm in self.0.index.iter() {
             let (key, sid) = itm.pair();
             // safe lookup: an out-of-bounds index used to fall through to a
             // `get_unchecked` here, which is UB — exactly when validation
@@ -734,25 +806,25 @@ impl UniqueStrStore {
 #[cfg(feature = "size_of")]
 impl SizeOf for UniqueStrStore {
     fn size_of_children(&self, context: &mut Context) {
-        self.store.read().size_of_children(context);
-        self.ascii.size_of_children(context);
+        self.0.store.read().size_of_children(context);
+        self.0.ascii.size_of_children(context);
 
-        if self.index.capacity() > 0 {
+        if self.0.index.capacity() > 0 {
             // key + value + RwLock
-            let used: usize = (8 + 4 + 8) * self.index.len();
-            let total: usize = (8 + 4 + 8) * self.index.capacity();
+            let used: usize = (8 + 4 + 8) * self.0.index.len();
+            let total: usize = (8 + 4 + 8) * self.0.index.capacity();
             context
                 .add(used)
                 .add_excess(total - used)
                 .add_distinct_allocation();
 
-            self.index.iter().for_each(|itm| {
+            self.0.index.iter().for_each(|itm| {
                 itm.key().size_of_children(context);
                 itm.value().size_of_children(context);
             });
         };
 
-        self.index.hasher().size_of_children(context);
+        self.0.index.hasher().size_of_children(context);
     }
 }
 
@@ -885,10 +957,15 @@ which allows it to be used in place of a "normal" string slice.
 pub struct StoredStr<'a>(u32, &'a UniqueStrStore);
 
 impl<'a> StoredStr<'a> {
-    /// This method is safe to call, as our reference is guaranteed to be valid.
+    /**
+    Safe to call without a bounds check: a [StoredStr] can only be built
+    from an index the store handed out (`get_ref` / `insert_or_get`), and
+    the store is append-only, so the slot exists for as long as `'a`.
+    Skipping the check saves a redundant length compare on every deref.
+    */
     #[inline]
     fn reference(&self) -> &str {
-        unsafe { (*self.1).borrow_str(self.0) }
+        unsafe { &*self.1.get_str_ptr(self.0) }
     }
 
     pub fn as_ptr(&self) -> StoredStrPtr {
@@ -933,6 +1010,15 @@ impl<'a> Eq for StoredStr<'a> {}
 
 impl<'a> PartialEq for StoredStr<'a> {
     fn eq(&self, other: &Self) -> bool {
+        /*
+        Same underlying store: interning guarantees equal content <=>
+        equal index, so the indices decide without touching the lock.
+        Two clones of one store share the `Arc`, hence `Arc::ptr_eq`
+        rather than comparing the `&UniqueStrStore` addresses.
+        */
+        if Arc::ptr_eq(&self.1 .0, &other.1 .0) {
+            return self.0 == other.0;
+        }
         self.reference() == other.reference()
     }
 }
@@ -993,11 +1079,9 @@ impl<'a> From<StoredStr<'a>> for u32 {
 }
 
 impl<'a> From<StoredStr<'a>> for &'a str {
-    fn from(v: StoredStr) -> &'a str {
-        unsafe {
-            let ptr: *const str = (*v.1).borrow_str(v.0) as *const str;
-            &*ptr
-        }
+    fn from(v: StoredStr<'a>) -> &'a str {
+        // see `reference` for why the unchecked lookup is sound
+        unsafe { &*v.1.get_str_ptr(v.0) }
     }
 }
 

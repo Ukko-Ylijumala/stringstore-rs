@@ -32,7 +32,6 @@ version = "6.0"
 
 [dependencies.custom_xxh3]
 git = "https://github.com/Ukko-Ylijumala/custom_xxh3"
-features = ["size_of"]
 
 [dependencies.timesince]
 git = "https://github.com/Ukko-Ylijumala/timesince-rs"

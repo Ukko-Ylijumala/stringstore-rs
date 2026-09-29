@@ -5,7 +5,7 @@
 ## Locking primitives
 
 - `store`: `parking_lot::RwLock<Vec<Box<str>>>` — writers exclusive, readers shared.
-- `index`: `dashmap::DashMap<u64, u32, CustomXxh3Hasher>` — internally sharded, lock-free for non-conflicting keys.
+- `index`: `dashmap::DashMap<u64, u32, PreHashed>` — internally sharded, lock-free for non-conflicting keys. `PreHashed` is an identity hasher (the keys are xxh3 digests already; see `storage-architecture.md`).
 - `len`: `std::sync::atomic::AtomicU32` — atomic public length counter. Incremented with `Release` (under the write lock, after the push); `len()` loads with `Acquire`, so a reader that observes the new length is guaranteed to see the pushed element.
 - `ascii`: no synchronization — built once at construction, never mutated.
 
@@ -82,11 +82,11 @@ The losing thread:
 
 No `Box<str>` is allocated on the losing path — the only allocation on the entire insert path happens inside the winner's `store.push(s.into())`.
 
-## Transient `idx()`/`get()` disagreement during insert
+## `idx()` and `get()` agree, even mid-insert
 
-Inside `insert_unchecked`, the DashMap entry is published (step 3) *before* `store.push` completes (step 4) — both inside the write-lock critical section, but the DashMap is readable without that lock. A concurrent bare `idx(s)` can therefore return an index for which `get(idx)` momentarily returns `Err(IndexOutOfBounds)`: `get` consults the `len` counter, which is incremented last. The window closes when the writer releases the lock.
+Inside `insert_unchecked`, the DashMap entry is published (step 3) *before* `store.push` completes (step 4) — both inside the write-lock critical section, but the DashMap is readable without that lock. A concurrent bare `idx(s)` can therefore return an index whose slot has not been pushed yet.
 
-Nothing dangles — `borrow_str`/`get_str_ptr` block on the read lock, so they cannot observe the half-inserted state; the disagreement is only between `idx()`'s answer and `get()`'s bounds check. The `insert` fast path is immune: it acquires the read lock before dereferencing, which serializes it after the writer's critical section. Callers who treat `idx() == Some(i)` as a promise that `get(i)` succeeds *right now* (rather than eventually) are the only ones who can notice.
+This is unobservable through `get`: every bounds-checked read (`get`, `borrow_str`, both via `lookup`) takes the store *read lock* and checks against `store.len()` under it, which serializes it after the writer's critical section. `get` used to check against the lock-free `len` counter instead, which opened a window where `idx(s) == Some(i)` but `get(i)` returned `Err(IndexOutOfBounds)`; that window no longer exists. The `len` counter is still incremented last and still uses `Release`, so `len()` itself remains a safe lower bound on what `get` will accept.
 
 ## `validate_contents` takes a write lock
 

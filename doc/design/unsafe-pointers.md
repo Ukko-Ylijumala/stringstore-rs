@@ -11,7 +11,7 @@
 | `get_ptr(idx) -> StoredStrPtr` *(unsafe)* | raw `*const str` wrapper | **no** | no |
 | `StoredStr<'a>` (returned by internal `get_ref`/`insert_or_get`) | safe handle holding `&'a UniqueStrStore` | yes | no |
 
-`get_str_ptr` is the internal building block all four sit on top of.
+Two internal building blocks sit underneath: `lookup` (bounds-checked, one read-lock acquisition, returns `Option<*const str>`) for `get` and `borrow_str`, and `get_str_ptr` (unchecked) for `get_ptr` and `StoredStr`, which only ever hold indices the store itself handed out.
 
 ## Why the references can outlive the read lock
 
@@ -59,12 +59,13 @@ The documented contract is: **the pointer is valid only as long as the originati
 ## `borrow_str`'s panic check
 
 ```rust
-if idx >= LATIN1_NUM && (idx - LATIN1_NUM) as usize >= self.store.read().len() {
-    panic!("Store index {idx} out of bounds (max: {})", self.len() - 1);
+match self.lookup(idx) {
+    Some(ptr) => &*ptr,
+    None => panic!("Store index {idx} out of bounds (max: {})", self.len() - 1),
 }
 ```
 
-The first condition is `>=`, not `>`. This ensures that `idx == LATIN1_NUM` (256) on an empty user-string store panics rather than passing through to `store.get_unchecked(0)`. Indices in `0..LATIN1_NUM` are always valid (the `ascii` vector is fixed-size and pre-populated), so the check only needs to fire for `idx >= LATIN1_NUM`.
+`lookup` returns `None` when `store.get(idx - LATIN1_NUM)` does, evaluated under the read lock, so `idx == LATIN1_NUM` (256) on an empty user-string store panics rather than reaching an unchecked slot. Indices in `0..LATIN1_NUM` are always valid (the `ascii` vector is fixed-size and pre-populated) and never touch the lock. An earlier version did the length check and the pointer fetch as two separate read-lock acquisitions; they are now one.
 
 Even with the bounds check, `borrow_str` is `unsafe` because the returned `&str` outlives the read lock — callers must uphold the append-only contract described above. Use `get` for any path where the index is not statically known to be valid.
 

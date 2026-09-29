@@ -43,7 +43,7 @@ The design of the non-obvious bits lives in [`doc/design/`](doc/design/README.md
 
 Four dependencies are git-pinned to forks under `Ukko-Ylijumala`:
 
-- `custom_xxh3` — provides `CustomXxh3Hasher` and `hash_bytes`.
+- `custom_xxh3` — provides `hash_bytes` (xxh3-64 with a fixed custom secret). The index map itself uses the crate-local identity hasher `PreHashed`, since its keys are already digests.
 - `timesince` — `SecondsSinceEpoch`, used only by the dormant `TextElement` enum.
 - `miniutils` — `normalize_path`, used by `store_path`.
 - `size-of` (fork) — replaces the upstream crate to work around Rust 1.89+ compiler error E0570. Only pulled in when the `size_of` feature is enabled.

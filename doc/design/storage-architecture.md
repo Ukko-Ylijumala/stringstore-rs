@@ -4,18 +4,20 @@
 
 ## The three backing containers
 
+`UniqueStrStore` itself is a newtype around `Arc<StoreInner>`; all four fields below live in that one allocation, so `Clone` is a single refcount increment and every access dereferences one pointer.
+
 ```text
 public index space:    0 ─────────────── 255 │ 256 ────────────── u32::MAX
                        └── ascii Vec ───┘    │ └── store Vec (offset by 256) ──┘
-                       (fixed, no lock)      │ (Arc<RwLock<Vec<Box<str>>>>)
+                       (fixed, no lock)      │ (RwLock<Vec<Box<str>>>)
 
-content lookup:        index: Arc<DashMap<u64 xxh3 hash, u32 internal index>>
-length:                len: Arc<AtomicU32>  // public length, starts at 256
+content lookup:        index: DashMap<u64 xxh3 hash, u32 internal index, PreHashed>
+length:                len: AtomicU32  // public length, starts at 256
 ```
 
-1. **`ascii: Arc<Vec<Box<str>>>`** — a fixed 256-entry vector populated once at construction with every ISO-8859-1 codepoint as a one-character `Box<str>`. The empty string `""` replaces `'\0'` at index 0, so a NUL string is *not* covered by this table: `return_iso8859_1_cp` rejects codepoint 0 and `"\0"` is interned through the regular hash-indexed path like any other content. Read access skips both the `RwLock` and the hash map entirely.
-2. **`store: Arc<RwLock<Vec<Box<str>>>>`** — the actual interned strings. Internally indexed `0..N`, but every public-facing index is offset by `LATIN1_NUM` (256).
-3. **`index: Arc<DashMap<u64, u32, CustomXxh3Hasher>>`** — content-to-position lookup, keyed by the xxh3 hash of the bytes. The stored value is the *internal* `store` index (pre-offset).
+1. **`ascii: Vec<Box<str>>`** — a fixed 256-entry vector populated once at construction with every ISO-8859-1 codepoint as a one-character `Box<str>`. The empty string `""` replaces `'\0'` at index 0, so a NUL string is *not* covered by this table: `return_iso8859_1_cp` rejects codepoint 0 and `"\0"` is interned through the regular hash-indexed path like any other content. Read access skips both the `RwLock` and the hash map entirely.
+2. **`store: RwLock<Vec<Box<str>>>`** — the actual interned strings. Internally indexed `0..N`, but every public-facing index is offset by `LATIN1_NUM` (256).
+3. **`index: DashMap<u64, u32, PreHashed>`** — content-to-position lookup, keyed by the xxh3 hash of the bytes. The stored value is the *internal* `store` index (pre-offset). `PreHashed` is an identity `BuildHasher`: the keys are already uniformly distributed 64-bit digests, so the map passes them straight through instead of running them through a second (streaming, 832-byte-state) Xxh3 pass per lookup. That second pass used to cost ~140 ns per map operation versus ~30 ns now; it is the single largest cost that was removed from `contains`/`idx`/`insert`.
 
 `len` is a `std::sync::atomic::AtomicU32` that holds the authoritative public length. It starts at 256 (the ASCII range is always "present"), and is incremented under the write lock in `insert_unchecked` only after a successful new insertion. The increment uses `Release` ordering and `len()` loads with `Acquire`, so observing the new length implies the corresponding push is visible.
 
@@ -31,9 +33,9 @@ The constant `LATIN1_NUM = 256` is load-bearing. Any code touching indices must 
 Translation points to watch:
 
 - `idx()`: returns `self.index.get(...).map(|r| r.value() + LATIN1_NUM)` — DashMap value is internal, add the offset for the public answer.
-- `get_str_ptr(idx)`: branches on `idx < LATIN1_NUM`. If yes, hit `ascii[idx]` directly. If no, take the read lock and index into `store[idx - LATIN1_NUM]`.
+- `lookup(idx)` / `get_str_ptr(idx)`: branch on `idx < LATIN1_NUM`. If yes, hit `ascii[idx]` directly. If no, take the read lock and index into `store[idx - LATIN1_NUM]`. `lookup` is the bounds-checked form (`get`, `borrow_str`) and takes the lock exactly once; `get_str_ptr` is the unchecked form for callers that already hold a valid index (`get_ptr`, `StoredStr`).
 - `insert_unchecked`: `let idx: u32 = store.len() as u32;` is internal; the return value is `indexed + LATIN1_NUM`.
-- `reconstruct`: same branch as `get_str_ptr` when fetching each part.
+- `reconstruct`: same branch as `lookup` when fetching each part, under one read lock for the whole rebuild.
 
 ## Why the split exists
 
