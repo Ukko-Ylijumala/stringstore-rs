@@ -1,6 +1,9 @@
 // Copyright (c) 2024-2026 Mikko Tanner. All rights reserved.
 
+#[cfg(not(feature = "xxh128"))]
 use custom_xxh3::hash_bytes;
+#[cfg(feature = "xxh128")]
+use xxhash_rust::xxh3::xxh3_128;
 use dashmap::DashMap;
 use miniutils::normalize_path;
 use parking_lot::RwLock;
@@ -30,6 +33,23 @@ const PATH_SEP: &str = "/";
 const LATIN1_NUM: u32 = 256;
 /// Maximum number of user-inserted strings; see `insert_unchecked`.
 const MAX_USER_STRINGS: usize = (u32::MAX - LATIN1_NUM) as usize;
+
+/**
+The index key: an xxh3 digest of the string bytes.
+
+64 bits by default, which is the memory-efficient choice: a hash hit is
+verified against the stored contents (one read lock + one compare on the
+duplicate-insert path) so a collision panics instead of corrupting
+indices. The `xxh128` feature widens the key to 128 bits, which makes a
+collision negligible enough (~n²/2¹²⁹) that the verification is skipped
+and duplicate inserts never touch the store lock — at the cost of doubling
+the per-entry footprint of the index map. See
+`doc/design/storage-architecture.md`.
+*/
+#[cfg(not(feature = "xxh128"))]
+type HashKey = u64;
+#[cfg(feature = "xxh128")]
+type HashKey = u128;
 
 /**
 A memory-efficient storage for unique string slices with stable indexing.
@@ -116,22 +136,23 @@ through one pointer instead of four separately allocated ones.
 #[derive(Debug)]
 struct StoreInner {
     store: RwLock<Vec<Box<str>>>,
-    index: DashMap<u64, u32, PreHashed>,
+    index: DashMap<HashKey, u32, PreHashed>,
     ascii: Vec<Box<str>>,
     len: AtomicU32,
 }
 
 /**
-[BuildHasher] for the index map, whose keys are already 64-bit xxh3
-digests of the string bytes. Re-hashing them through a full Xxh3 state
+[BuildHasher] for the index map, whose keys are already xxh3 digests of
+the string bytes ([HashKey]). Re-hashing them through a full Xxh3 state
 (832 bytes, rebuilt on every lookup) cost ~140 ns per map operation;
 passing the key straight through costs ~30 ns.
 
-This is sound because xxh3 output is uniformly distributed across all 64
-bits, which is what [DashMap]'s shard selection (high bits) and
+This is sound because xxh3 output is uniformly distributed across all of
+its bits, which is what [DashMap]'s shard selection (high bits) and
 hashbrown's control bytes / bucket index (top 7 bits, low bits) rely on.
+A 128-bit key is xor-folded to 64 bits so every key bit still takes part.
 `write` exists only to satisfy the trait; the map never hashes anything
-but a `u64`.
+but a [HashKey].
 */
 #[derive(Clone, Copy, Default)]
 struct PreHashed(u64);
@@ -140,6 +161,11 @@ impl Hasher for PreHashed {
     #[inline]
     fn write_u64(&mut self, key: u64) {
         self.0 = key;
+    }
+
+    #[inline]
+    fn write_u128(&mut self, key: u128) {
+        self.0 = (key as u64) ^ ((key >> 64) as u64);
     }
 
     fn write(&mut self, bytes: &[u8]) {
@@ -231,9 +257,10 @@ impl UniqueStrStore {
     Whether we already have this string slice stored.
 
     NOTE: this is a pure hash lookup (no content comparison, no locking),
-    so a never-inserted string whose 64-bit xxh3 hash collides with a
-    stored one yields a false positive. `insert` does verify contents;
-    see `doc/design/storage-architecture.md` for the collision policy.
+    so a never-inserted string whose xxh3 hash collides with a stored one
+    yields a false positive. `insert` does verify contents (with 64-bit
+    keys; see [HashKey]) — `doc/design/storage-architecture.md` has the
+    collision policy.
     */
     #[inline]
     pub fn contains(&self, s: &str) -> bool {
@@ -247,15 +274,15 @@ impl UniqueStrStore {
             return true;
         }
 
-        self.0.index.contains_key(&hash_bytes(s.as_bytes()))
+        self.0.index.contains_key(&hash_key(s.as_bytes()))
     }
 
     /**
     Get the index of a stored string slice by its content, if it exists.
 
-    NOTE: like `contains`, this is a pure hash lookup — a 64-bit xxh3
-    collision with a stored string returns that string's index instead
-    of `None`. `insert` is the verified path.
+    NOTE: like `contains`, this is a pure hash lookup — an xxh3 collision
+    with a stored string returns that string's index instead of `None`.
+    `insert` is the verified path (with 64-bit keys; see [HashKey]).
     */
     pub fn idx(&self, s: &str) -> Option<u32> {
         if s.is_empty() {
@@ -269,7 +296,7 @@ impl UniqueStrStore {
         }
 
         self.0.index
-            .get(&hash_bytes(s.as_bytes()))
+            .get(&hash_key(s.as_bytes()))
             .map(|r| r.value() + LATIN1_NUM)
     }
 
@@ -367,7 +394,7 @@ impl UniqueStrStore {
     We still must check again after acquiring the write locks, as another
     thread might have gone behind our back in the meantime.
     */
-    fn insert_unchecked(&self, s: &str, key: u64) -> StringStoreResult<u32> {
+    fn insert_unchecked(&self, s: &str, key: HashKey) -> StringStoreResult<u32> {
         let mut store = self.0.store.write();
         let len: usize = store.len();
 
@@ -395,11 +422,9 @@ impl UniqueStrStore {
             self.0.len.fetch_add(1, AtomicOrdering::Release);
         } else {
             // someone else interned this hash first: make sure it is
-            // actually the same string and not a 64-bit hash collision
-            let stored: &str = &store[indexed as usize];
-            if stored != s {
-                collision_panic(stored, s, indexed);
-            }
+            // actually the same string and not a hash collision
+            #[cfg(not(feature = "xxh128"))]
+            verify_hit(&store, indexed, s);
         }
         Ok(indexed + LATIN1_NUM)
     }
@@ -423,19 +448,18 @@ impl UniqueStrStore {
         a shard guard while taking the store lock would invert the
         store -> index lock order used by `insert_unchecked`.
         */
-        let key: u64 = hash_bytes(s.as_bytes());
+        let key: HashKey = hash_key(s.as_bytes());
         if let Some(internal) = self.0.index.get(&key).map(|r| *r.value()) {
             /*
-            The slot is guaranteed to exist: the entry is only ever
-            published inside the write-lock critical section that also
-            pushes the string, so acquiring the read lock here means
-            that section has completed.
+            64-bit keys: verify the hit under the read lock. The slot is
+            guaranteed to exist, because the entry is only ever published
+            inside the write-lock critical section that also pushes the
+            string, so acquiring the read lock here means that section
+            has completed. 128-bit keys (`xxh128`): the hash is trusted
+            and this path never touches the store lock at all.
             */
-            let store = self.0.store.read();
-            let stored: &str = &store[internal as usize];
-            if stored != s {
-                collision_panic(stored, s, internal);
-            }
+            #[cfg(not(feature = "xxh128"))]
+            verify_hit(&self.0.store.read(), internal, s);
             return Ok(internal + LATIN1_NUM);
         }
         self.insert_unchecked(s, key)
@@ -446,8 +470,9 @@ impl UniqueStrStore {
     Returns the index in either case.
 
     On a hash hit the existing string's contents are compared against `s`;
-    a mismatch means a genuine 64-bit xxh3 collision, which the hash-keyed
-    index cannot represent, and results in a panic. See
+    a mismatch means a genuine xxh3 collision, which the hash-keyed index
+    cannot represent, and results in a panic. With the `xxh128` feature the
+    key is 128 bits wide and the comparison is skipped; see [HashKey] and
     `doc/design/storage-architecture.md` for the collision policy.
 
     Panics when the store is full (the u32 index space is exhausted) —
@@ -467,8 +492,8 @@ impl UniqueStrStore {
     Like `insert`, but returns [StringStoreError::StoreFull] instead of
     panicking when the u32 index space is exhausted.
 
-    NOTE: a genuine 64-bit hash collision still panics — it signals that
-    the store cannot represent the string at all, which no caller can
+    NOTE: a genuine hash collision (64-bit keys) still panics — it signals
+    that the store cannot represent the string at all, which no caller can
     meaningfully recover from. See `doc/design/storage-architecture.md`.
     */
     pub fn try_insert<T>(&self, s: T) -> StringStoreResult<u32>
@@ -735,7 +760,7 @@ impl UniqueStrStore {
 
         // Check that each store entry has a corresponding index.
         for (sid, s) in store.iter().enumerate() {
-            let key: u64 = hash_bytes(s.as_bytes());
+            let key: HashKey = hash_key(s.as_bytes());
             if !self.0.index.contains_key(&key) {
                 errs.push(format!("missing hash: 0x{key:x} (str_id: {sid}, str: '{s}')"));
             } else {
@@ -765,7 +790,7 @@ impl UniqueStrStore {
                     continue;
                 }
             };
-            let csum: u64 = hash_bytes(s.as_bytes());
+            let csum: HashKey = hash_key(s.as_bytes());
             if csum != *key {
                 errs.push(format!(
                     "hash mismatch for '{s}' (stored: 0x{key:x}, calculated: 0x{csum:x})"
@@ -795,8 +820,9 @@ impl SizeOf for UniqueStrStore {
 
         if self.0.index.capacity() > 0 {
             // key + value + RwLock
-            let used: usize = (8 + 4 + 8) * self.0.index.len();
-            let total: usize = (8 + 4 + 8) * self.0.index.capacity();
+            let entry: usize = size_of::<HashKey>() + size_of::<u32>() + 8;
+            let used: usize = entry * self.0.index.len();
+            let total: usize = entry * self.0.index.capacity();
             context
                 .add(used)
                 .add_excess(total - used)
@@ -1519,11 +1545,42 @@ pub fn tokenize_regex(s: &str, delims: &[&str]) -> Vec<Token> {
 
 /* ########################## UTILITY FUNCTIONS ############################ */
 
+/// Hash string bytes into the index key; see [HashKey].
+#[cfg(not(feature = "xxh128"))]
+#[inline]
+fn hash_key(bytes: &[u8]) -> HashKey {
+    hash_bytes(bytes)
+}
+
+/// Hash string bytes into the index key; see [HashKey].
+#[cfg(feature = "xxh128")]
+#[inline]
+fn hash_key(bytes: &[u8]) -> HashKey {
+    xxh3_128(bytes)
+}
+
 /**
-A genuine 64-bit xxh3 collision between two distinct strings. The index
-is keyed by hash alone, so the store cannot represent both — and silently
-returning the other string's index would corrupt every downstream user.
+Confirm that the store slot a hash lookup returned really holds `s`.
+With 64-bit keys a hit may be a genuine collision, which the hash-keyed
+index cannot represent, so a mismatch panics. Not compiled with the
+`xxh128` feature: there the hash is trusted, which is exactly what makes
+the duplicate-insert path lock-free.
 */
+#[cfg(not(feature = "xxh128"))]
+#[inline]
+fn verify_hit(store: &[Box<str>], internal: u32, s: &str) {
+    let stored: &str = &store[internal as usize];
+    if stored != s {
+        collision_panic(stored, s, internal);
+    }
+}
+
+/**
+A genuine xxh3 collision between two distinct strings. The index is keyed
+by hash alone, so the store cannot represent both — and silently returning
+the other string's index would corrupt every downstream user.
+*/
+#[cfg(not(feature = "xxh128"))]
 #[cold]
 #[inline(never)]
 fn collision_panic(stored: &str, new: &str, internal: u32) -> ! {
@@ -1911,6 +1968,13 @@ mod tests {
         // Single chars beyond Latin-1 also intern normally.
         let idx: u32 = store.insert("€");
         assert_eq!(store.get(idx).unwrap(), "€");
+    }
+
+    #[test]
+    fn test_hash_key_width() {
+        // the `xxh128` feature is the only thing that changes the key type
+        let expected: usize = if cfg!(feature = "xxh128") { 16 } else { 8 };
+        assert_eq!(size_of::<HashKey>(), expected);
     }
 
     #[test]

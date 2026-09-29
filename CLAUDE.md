@@ -10,6 +10,7 @@ Standard Cargo workflow. The crate is `publish = false` and intended for consump
 - Run all tests: `cargo test`
 - Run a single test: `cargo test test_concurrent_inserts` (the `CONC_S_NUM = 100_000` constant makes the concurrency tests the slow ones)
 - Test with the optional memory-accounting feature: `cargo test --features size_of`
+- Test with 128-bit index keys: `cargo test --features xxh128` (the full matrix is `""`, `xxh128`, `size_of`, `xxh128,size_of`; clippy the same way)
 - Lint: `cargo clippy --all-targets`
 
 Tests live inline at the bottom of `src/lib.rs` under `mod tests` — there is no `tests/` directory.
@@ -43,10 +44,14 @@ The design of the non-obvious bits lives in [`doc/design/`](doc/design/README.md
 
 Four dependencies are git-pinned to forks under `Ukko-Ylijumala`:
 
-- `custom_xxh3` — provides `hash_bytes` (xxh3-64 with a fixed custom secret). The index map itself uses the crate-local identity hasher `PreHashed`, since its keys are already digests.
+- `custom_xxh3` — provides `hash_bytes` (xxh3-64 with a fixed custom secret), the default index key. The index map itself uses the crate-local identity hasher `PreHashed`, since its keys are already digests.
+
+`xxhash-rust` (crates.io) is pulled in directly, and only with the `xxh128` feature, for `xxh3_128`; `custom_xxh3` has no 128-bit helper yet.
 - `timesince` — `SecondsSinceEpoch`, used only by the dormant `TextElement` enum.
 - `miniutils` — `normalize_path`, used by `store_path`.
 - `size-of` (fork) — replaces the upstream crate to work around Rust 1.89+ compiler error E0570. Only pulled in when the `size_of` feature is enabled.
+
+The `xxh128` feature (off by default) switches the index key `HashKey` from `u64` to `u128` and compiles out the duplicate-insert content check (`verify_hit`, `collision_panic`); every hashing site goes through `hash_key`, so the two builds differ only there. Doubles the index map's per-entry footprint, which is why it is opt-in. See `doc/design/storage-architecture.md`.
 
 The `size_of` feature is currently *off* by default (the `default = ["size_of"]` line in `Cargo.toml` is commented out). The `SizeOf for UniqueStrStore` impl is hand-rolled because `size_of` does not natively support `RwLock` or `DashMap`.
 

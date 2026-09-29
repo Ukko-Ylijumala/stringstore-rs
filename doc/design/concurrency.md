@@ -34,6 +34,8 @@ This is also what makes `contains` and `idx` close to free under contention: a w
                        │         compare contents:                (fast path,
                        │           equal    ──► return existing index    no write lock)
                        │           mismatch ──► collision_panic
+                       │         (`xxh128` feature: no lock, no compare —
+                       │          return the index straight away)
                        │
                        └── miss ──► insert_unchecked(s, key):
                                       1. take store write lock
@@ -57,6 +59,8 @@ The whole path borrows: `insert<T: AsRef<str>>` never copies the input string. T
 Step 3 is the atomic decision point — **not** the earlier hash lookup in the public `insert`. Between that lookup and acquiring the write lock, another thread can win the race and insert the same string. The DashMap `entry().or_insert(idx)` resolves this: only the thread whose `idx` was actually inserted into the map is permitted to push into `store`.
 
 If a refactor moves the hash-hit check inside the write-lock region, the recheck still has to remain — two threads can both miss before *either* takes the write lock.
+
+Under the `xxh128` feature the compare in step 4's else-branch and in the fast path is compiled out (`verify_hit` does not exist); the `entry().or_insert()` decision point is unchanged, so the race handling is identical.
 
 ### The lock-ordering rule in the fast path
 
