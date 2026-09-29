@@ -62,8 +62,8 @@ See [`doc/design/`](doc/design/README.md) for per-feature design notes — stora
 
 - No string removal or modification (this is what makes the index stability and unsafe pointer surface sound — see [`doc/design/unsafe-pointers.md`](doc/design/unsafe-pointers.md)).
 - No partial deduplication; substrings of stored strings are not themselves shared.
-- Maximum unique strings: `u32::MAX - 255`. `insert` panics on overflow rather than returning a `StoreFull` error (the public signature returns `u32`; a future `try_insert -> Result<u32>` could surface this cleanly).
-- The two tokenizers used by `split_and_store_multi` can disagree on inputs with overlapping delimiters. See [`doc/design/tokenization.md`](doc/design/tokenization.md).
+- Maximum user-inserted unique strings: `u32::MAX - 256`. `insert` panics on overflow; `try_insert` returns `StoreFull` instead.
+- Delimiter matching in `tokenize` / `split_and_store_multi` is leftmost-first with the earliest delimiter in the slice winning, so the order of overlapping delimiters matters. See [`doc/design/tokenization.md`](doc/design/tokenization.md).
 
 ## License
 

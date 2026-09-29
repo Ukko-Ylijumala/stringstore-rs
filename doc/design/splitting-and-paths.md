@@ -25,7 +25,7 @@ For absolute paths via `store_path`, the same convention reads as "the path begi
 
 `split_and_store(s, delim)` is the single-delimiter form. It uses `str::split` directly — no tokenizer involved — and returns `(parts: Vec<u32>, delim_idx: u32)`.
 
-`split_and_store_multi(s, delims, force_regex)` is the multi-delimiter form. It uses one of the two tokenizers (see `tokenization.md`) and returns `(parts: Vec<u32>, delim_indices: Vec<u32>)`. **Crucially, the `parts` vector includes the delimiters as tokens, interleaved with the non-delimiter parts** — this is different from the single-delimiter form, where the delimiter appears only in the second tuple element.
+`split_and_store_multi(s, delims, force_regex)` is the multi-delimiter form. It runs the scanner (see `tokenization.md`; `force_regex` is a retained no-op) and interns each emitted slice directly, returning `(parts: Vec<u32>, delim_indices: Vec<u32>)`. **Crucially, the `parts` vector includes the delimiters as tokens, interleaved with the non-delimiter parts** — this is different from the single-delimiter form, where the delimiter appears only in the second tuple element.
 
 This asymmetry exists because the multi-delimiter case cannot be reconstructed by a simple `parts.join(delim)`: different delimiters can appear at different positions. The interleaved encoding preserves which delimiter went where.
 
@@ -59,6 +59,6 @@ The function takes the `store` **read lock** for the duration of the rebuild and
 - **Empty input string with `split_and_store`**: returns `([0], delim_idx)`. The delimiter is still interned even though nothing was split.
 - **Empty input string with `split_and_store_multi`**: returns `([0], delim_indices)` — delimiters still get interned.
 - **Empty `delims` slice in `split_and_store_multi`**: returns `([insert(s)], [])` — the whole string is interned as one part, no splitting.
-- **Empty delimiter in `delims`**: stored as index `0` in `delim_indices` and skipped by the tokenizer (see `tokenization.md`).
+- **Empty delimiter in `delims`**: stored as index `0` in `delim_indices` and skipped by the scanner (see `tokenization.md`).
 - **Empty `indices` to `reconstruct`**: returns `Ok("")`, regardless of `delim`.
 - **`indices == [0]`**: also returns `Ok("")` — single-element zero-sentinel is treated as the empty input case.

@@ -4,13 +4,11 @@ use custom_xxh3::hash_bytes;
 use dashmap::DashMap;
 use miniutils::normalize_path;
 use parking_lot::RwLock;
-use regex::{escape, Regex};
 use std::{
     cmp::Ordering,
     error::Error,
     fmt::{self, Debug, Display, Formatter},
     hash::{BuildHasher, Hash, Hasher},
-    mem,
     net::IpAddr, //Ipv4Addr, Ipv6Addr},
     ops::Deref,
     path::{Path, PathBuf},
@@ -551,19 +549,18 @@ impl UniqueStrStore {
     the storage indices of the provided delimiters.
 
     First, the delimiters provided in `delims` are stored, then the string
-    `s` is split based on these delimiters. Each unique part obtained from
-    splitting is stored and its index returned. By default, a simple tokenizer
-    is used for shorter strings, while a regex-based tokenizer handles longer
-    strings and/or larger sets of delimiters. This can be overridden by the
-    `force_regex` optional boolean.
+    `s` is split based on these delimiters by the byte-class scanner (see
+    `doc/design/tokenization.md`) and each part is stored and its index
+    returned. The parts are interned straight from slices of `s`; no
+    intermediate [Token]s are allocated.
 
     ## Arguments
     * `s` - a string slice to be atomized
     * `delims` - string slices, based on which `s` shall be split
-    * `force_regex` - whether to use the regex-based tokenizer
-      - `None` - auto-detect based on string length and number of delimiters
-      - `Some(true)` - force regex-based tokenizer
-      - `Some(false)` - force simple tokenizer
+    * `force_regex` - **ignored.** It used to select between a linear and a
+      regex-based tokenizer; there is one scanner now and it outperforms
+      both at every input size measured. The parameter is retained so the
+      signature stays stable.
 
     ## Returns
     A tuple of two [Vec]s:
@@ -575,10 +572,8 @@ impl UniqueStrStore {
     - If `delims` is empty, the function returns a Vec of the index of `s`
       itself (assuming `s` is not empty), and an empty Vec for delimiters.
 
-    NOTE: the two tokenizers are implemented differently but share the same
-    matching semantics (leftmost-first, earliest delimiter in `delims` wins),
-    so they yield identical output for the same input — including overlapping
-    delimiters. `force_regex` only affects performance, never the result.
+    Matching is leftmost-first with the earliest delimiter in `delims`
+    winning at a given position, exactly like `tokenize`.
     */
     pub fn split_and_store_multi(
         &self,
@@ -586,11 +581,9 @@ impl UniqueStrStore {
         delims: &[&str],
         force_regex: Option<bool>,
     ) -> (Vec<u32>, Vec<u32>) {
-        let complexity: usize = s.len() * delims.len(); // rough estimate
+        let _ = force_regex; // see the doc comment: no-op since unification
         let mut result: Vec<u32> = vec![];
         let mut delim_indices: Vec<u32> = vec![];
-        // TODO: evaluate thresholds for switching between tokenizers
-        let regex: bool = force_regex.unwrap_or(complexity > 10000 || delims.len() > 10);
 
         if !delims.is_empty() {
             // store the delimiters first
@@ -611,16 +604,7 @@ impl UniqueStrStore {
             return (vec![self.insert(s)], vec![]);
         }
 
-        if !regex {
-            // use the simple tokenizer for shorter strings
-            for token in tokenize(s, delims).iter() {
-                result.push(self.insert(&token.content));
-            }
-        } else {
-            for token in tokenize_regex(s, delims).iter() {
-                result.push(self.insert(&token.content));
-            }
-        }
+        scan_tokens(s, delims, |token: &str, _| result.push(self.insert(token)));
 
         (result, delim_indices)
     }
@@ -1398,138 +1382,139 @@ impl Token {
     }
 }
 
+/// Classification of a byte for the scanner's 256-entry lookup table.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ByteClass {
+    /// Nothing to check here; the scanner just advances.
+    Plain,
+    /// At least one non-empty delimiter starts with this byte.
+    DelimStart,
+}
+
 /**
-Tokenize a string by a set of delimiters and return a [Vec] of [Token]s.
-The delimiters are included as separate tokens.
+The scanner's per-byte lookup table. Every byte of the input is looked up
+here first, and only a `DelimStart` byte triggers the delimiter comparison
+loop — so for typical text the per-byte cost is one table load.
 
-This version uses a simple string search for delimiters.
+This is the extension point for richer tokenization later on (character
+class delimiters, repeated-character runs, enclosures that suppress
+splitting): each becomes another [ByteClass] variant and a branch in
+`scan_tokens`, without changing the entry points.
 */
-pub fn tokenize(s: &str, delims: &[&str]) -> Vec<Token> {
-    let mut tokens: Vec<Token> = Vec::new();
-    let mut current_token: String = String::new();
-    let mut i: usize = 0;
+struct ScanTable([ByteClass; 256]);
 
-    while i < s.len() {
-        // Skip empty delimiters: starts_with("") is always true and would
-        // otherwise advance the cursor by zero, hanging the loop.
-        if let Some((d_idx, delimiter)) = delims
-            .iter()
-            .enumerate()
-            .find(|(_, &d)| !d.is_empty() && s[i..].starts_with(d))
-        {
-            if !current_token.is_empty() {
-                tokens.push(Token {
-                    content: mem::take(&mut current_token),
-                    ..Default::default()
-                });
+impl ScanTable {
+    /// Build the table for `delims`; `None` if no delimiter is usable
+    /// (all empty or none given), in which case nothing can ever match.
+    fn new(delims: &[&str]) -> Option<Self> {
+        let mut table: [ByteClass; 256] = [ByteClass::Plain; 256];
+        let mut usable: bool = false;
+        for d in delims {
+            if let Some(&b) = d.as_bytes().first() {
+                table[b as usize] = ByteClass::DelimStart;
+                usable = true;
             }
-
-            tokens.push(Token {
-                content: delimiter.to_string(),
-                is_delim: true,
-                delim_idx: Some(d_idx),
-            });
-
-            i += delimiter.len();
-        } else {
-            /*
-            Advance by the full UTF-8 width of the char: advancing by one
-            byte would put `i` inside a multibyte char and panic on the
-            next `s[i..]` slice.
-            */
-            let c: char = s[i..].chars().next().unwrap();
-            current_token.push(c);
-            i += c.len_utf8();
         }
+        usable.then_some(Self(table))
     }
 
-    if !current_token.is_empty() {
-        tokens.push(Token {
-            content: current_token,
-            ..Default::default()
-        });
+    #[inline]
+    fn class(&self, b: u8) -> ByteClass {
+        self.0[b as usize]
+    }
+}
+
+/**
+The scanner core behind every tokenizing entry point. Calls `f` once per
+token in order, with the token's slice of `s` and, for a delimiter, the
+position of the matched delimiter in `delims`. Non-delimiter tokens are
+never empty.
+
+Matching is leftmost-first: at the leftmost position where any delimiter
+matches, the one that appears earliest in `delims` wins, and scanning
+resumes after it. Empty delimiters never match.
+
+## Why stepping byte-wise is safe on UTF-8
+
+A delimiter is valid UTF-8, so its first byte is never a continuation
+byte (`0x80..=0xBF`) and the table marks no continuation byte as
+`DelimStart`. A match can therefore only start on a char boundary, and
+since a delimiter consists of whole chars it also ends on one, so every
+slice taken below is on char boundaries. Bytes that do not start a match
+are simply skipped, whether or not they are inside a multibyte char.
+*/
+fn scan_tokens<'a, F>(s: &'a str, delims: &[&str], mut f: F)
+where
+    F: FnMut(&'a str, Option<usize>),
+{
+    let Some(table) = ScanTable::new(delims) else {
+        // no usable delimiters: the whole input is one token (or nothing)
+        if !s.is_empty() {
+            f(s, None);
+        }
+        return;
+    };
+
+    let bytes: &[u8] = s.as_bytes();
+    let mut i: usize = 0; // scan cursor
+    let mut start: usize = 0; // start of the pending non-delimiter token
+    while i < bytes.len() {
+        if table.class(bytes[i]) == ByteClass::DelimStart {
+            let hit = delims
+                .iter()
+                .enumerate()
+                .find(|(_, d)| !d.is_empty() && bytes[i..].starts_with(d.as_bytes()));
+            if let Some((d_idx, d)) = hit {
+                if start < i {
+                    f(&s[start..i], None);
+                }
+                let end: usize = i + d.len();
+                f(&s[i..end], Some(d_idx));
+                i = end;
+                start = end;
+                continue;
+            }
+        }
+        i += 1;
     }
 
-    tokens
+    if start < bytes.len() {
+        f(&s[start..], None);
+    }
 }
 
 /**
 Tokenize a string by a set of delimiters and return a [Vec] of [Token]s.
 The delimiters are included as separate tokens.
 
-In contrast to `tokenize()`, this version compiles a regex to find the
-delimiters, which should be faster for larger strings and more delimiters.
-The output is identical to `tokenize()` for every input: both implement
-leftmost-first matching with the earliest delimiter in `delims` winning
-at a given position (see `doc/design/tokenization.md`).
+Matching is leftmost-first with the earliest delimiter in `delims`
+winning at a given position; see `scan_tokens` and
+`doc/design/tokenization.md`. Empty delimiters are skipped without
+renumbering the others.
 */
-pub fn tokenize_regex(s: &str, delims: &[&str]) -> Vec<Token> {
-    // Skip empty delimiters: an empty alternative in the regex would match
-    // zero-width and emit garbage tokens at every position.
-    let non_empty: Vec<&str> = delims.iter().copied().filter(|d| !d.is_empty()).collect();
-
-    if non_empty.is_empty() {
-        // No usable delimiters: emit the input as a single non-delim token,
-        // or nothing if the input itself is empty.
-        if s.is_empty() {
-            return Vec::new();
-        }
-        return vec![Token {
-            content: s.to_string(),
-            ..Default::default()
-        }];
-    }
-
-    let pattern: String = non_empty
-        .iter()
-        .map(|p: &&str| escape(p))
-        .collect::<Vec<_>>()
-        .join("|");
-    /*
-    The pattern is a plain alternation of escaped literals, so the only way
-    compilation can fail is the regex crate's compiled-size limit on an
-    enormous delimiter set. The linear tokenizer produces identical output,
-    so fall back to it instead of panicking on caller-controlled input.
-    */
-    let re: Regex = match Regex::new(&pattern) {
-        Ok(re) => re,
-        Err(_) => return tokenize(s, delims),
-    };
+pub fn tokenize(s: &str, delims: &[&str]) -> Vec<Token> {
     let mut tokens: Vec<Token> = Vec::new();
-    let mut last_end: usize = 0;
-
-    for found in re.find_iter(s) {
-        let start: usize = found.start();
-        let end: usize = found.end();
-
-        // Add non-delimiter token if there's text before this delimiter
-        if start > last_end {
-            tokens.push(Token {
-                content: s[last_end..start].to_string(),
-                ..Default::default()
-            });
-        }
-
-        // Add delimiter token
-        let delimiter = found.as_str();
+    scan_tokens(s, delims, |content: &str, delim_idx: Option<usize>| {
         tokens.push(Token {
-            content: delimiter.to_string(),
-            is_delim: true,
-            delim_idx: Some(delims.iter().position(|&d| d == delimiter).unwrap()),
-        });
-
-        last_end = end;
-    }
-
-    // Add final non-delimiter token if there's remaining text
-    if last_end < s.len() {
-        tokens.push(Token {
-            content: s[last_end..].to_string(),
-            ..Default::default()
-        });
-    }
-
+            content: content.to_string(),
+            is_delim: delim_idx.is_some(),
+            delim_idx,
+        })
+    });
     tokens
+}
+
+/**
+Identical to [tokenize]; retained for API compatibility.
+
+This used to compile a regex alternation of the delimiters. The single
+scanner now outperforms that at every input size measured (the regex
+compile alone cost ~12 µs per call), so both names share one
+implementation and always produce the same output.
+*/
+#[inline]
+pub fn tokenize_regex(s: &str, delims: &[&str]) -> Vec<Token> {
+    tokenize(s, delims)
 }
 
 /* ########################## UTILITY FUNCTIONS ############################ */
@@ -1820,14 +1805,59 @@ mod tests {
         assert_eq!(tokens[2].content, "b");
     }
 
+    /**
+    Reference oracle for `scan_tokens`: the original char-by-char linear
+    tokenizer, kept verbatim. It is O(n * m) and allocates per char, but its
+    semantics (leftmost-first, earliest delimiter wins, empty delimiters
+    skipped, advance by whole chars) are exactly what the scanner must
+    reproduce.
+    */
+    fn reference_tokenize(s: &str, delims: &[&str]) -> Vec<Token> {
+        let mut tokens: Vec<Token> = Vec::new();
+        let mut current_token: String = String::new();
+        let mut i: usize = 0;
+
+        while i < s.len() {
+            if let Some((d_idx, delimiter)) = delims
+                .iter()
+                .enumerate()
+                .find(|(_, &d)| !d.is_empty() && s[i..].starts_with(d))
+            {
+                if !current_token.is_empty() {
+                    tokens.push(Token {
+                        content: std::mem::take(&mut current_token),
+                        ..Default::default()
+                    });
+                }
+                tokens.push(Token {
+                    content: delimiter.to_string(),
+                    is_delim: true,
+                    delim_idx: Some(d_idx),
+                });
+                i += delimiter.len();
+            } else {
+                let c: char = s[i..].chars().next().unwrap();
+                current_token.push(c);
+                i += c.len_utf8();
+            }
+        }
+
+        if !current_token.is_empty() {
+            tokens.push(Token {
+                content: current_token,
+                ..Default::default()
+            });
+        }
+        tokens
+    }
+
     #[test]
-    fn test_tokenizers_are_equivalent() {
+    fn test_scanner_matches_reference() {
         /*
-        Both tokenizers implement leftmost-first matching with the earliest
-        delimiter in `delims` winning, so they must agree on every input,
-        including overlapping delimiters ("ab" vs "abc", "a" vs "aa"), and
-        duplicated or empty delimiters. Deterministic LCG so a failure is
-        reproducible from the seed.
+        The byte-class scanner must agree with the reference tokenizer on
+        every input, including overlapping delimiters ("ab" vs "abc",
+        "a" vs "aa"), multibyte chars, and duplicated or empty delimiters.
+        Deterministic LCG so a failure is reproducible from the seed.
         */
         const ALPHABET: [&str; 4] = ["a", "b", "c", "é"];
         const DELIM_POOL: [&str; 11] =
@@ -1846,12 +1876,13 @@ mod tests {
             let len: usize = next(12);
             let s: String = (0..len).map(|_| ALPHABET[next(4)]).collect();
 
-            let linear: Vec<Token> = tokenize(&s, &delims);
-            let regex: Vec<Token> = tokenize_regex(&s, &delims);
+            let expected: Vec<Token> = reference_tokenize(&s, &delims);
+            let actual: Vec<Token> = tokenize(&s, &delims);
             assert_eq!(
-                linear, regex,
-                "case {case}: tokenizers diverge on {s:?} with delims {delims:?}"
+                actual, expected,
+                "case {case}: scanner diverges on {s:?} with delims {delims:?}"
             );
+            assert_eq!(tokenize_regex(&s, &delims), expected, "tokenize_regex must alias");
         }
     }
 

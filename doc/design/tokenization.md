@@ -1,6 +1,6 @@
 # Tokenization
 
-The crate ships two tokenizer implementations and a dispatcher that picks between them. They are similar in intent — split a string into a `Vec<Token>` where delimiters appear as their own tokens — but the implementations differ enough that they can disagree on pathological input. This doc covers the contract and the known divergence.
+The crate ships one tokenizer: a byte-class-table linear scanner, `scan_tokens`. Both public entry points (`tokenize`, `tokenize_regex`) and the store-aware `split_and_store_multi` sit on top of it. This doc covers the contract, the scanner's design, and the empty-delimiter footgun.
 
 ## `Token`
 
@@ -14,63 +14,64 @@ pub struct Token {
 
 Non-delimiter tokens have `is_delim = false` and `delim_idx = None`. Delimiter tokens carry the position of the matched delimiter in the original `delims: &[&str]` slice, which lets callers map back to "which delimiter matched here."
 
-## `tokenize` (linear scan)
+## Matching contract
 
-A hand-written O(n · m) scan: for each byte position, walk the delimiter list and check `s[i..].starts_with(d)`. On a match, flush any accumulated non-delimiter content as a `Token`, push the delimiter `Token`, and advance by the delimiter's length. Otherwise, append one `char` to the in-progress non-delimiter and advance by that char's UTF-8 width (advancing by a single byte would land mid-char on multibyte input and panic on the next slice).
+**Leftmost-first, earliest delimiter wins.** At the leftmost position where any delimiter matches, the delimiter that appears earliest in the `delims` slice is chosen, and scanning resumes immediately after it. Non-delimiter tokens are never empty; consecutive delimiters produce consecutive delimiter tokens with nothing in between.
 
-**Matching strategy:** first match wins — the delimiter that appears earliest in the `delims` slice is chosen. This matters for overlapping delimiters (see below).
+For overlapping delimiters this means order matters: `["ab", "abc"]` against `"xabcy"` yields `["x", "ab", "cy"]`. If you want the longest delimiter to win, sort the slice longest-first before calling.
 
-**Cost profile:** no regex compilation overhead, no allocation per match attempt. Best for short strings or small delimiter sets.
-
-## `tokenize_regex` (alternation regex)
-
-Builds a regex pattern of the form `escape(d0) | escape(d1) | ...`, compiles it with `Regex::new`, and iterates `re.find_iter(s)`. Between matches, the slice of `s` from the previous match end to the current match start becomes a non-delimiter token.
-
-**Matching strategy:** the `regex` crate's leftmost-first semantics. For a given starting byte position, the regex engine tries the alternatives in order and takes the first that matches — same idea as `tokenize`, but applied across the full pattern rather than re-evaluated for each byte. After a match, it advances past the match and continues from there.
-
-**Cost profile:** pays a one-time regex compilation cost, then scans in roughly O(n) thereafter. Best for long strings or large delimiter sets where the linear scan's inner loop dominates.
-
-## The dispatcher
-
-`split_and_store_multi` picks between them:
+## `scan_tokens` (the scanner core)
 
 ```rust
-let complexity: usize = s.len() * delims.len();
-let regex: bool = force_regex.unwrap_or_else(|| complexity > 10000 || delims.len() > 10);
+fn scan_tokens<'a, F: FnMut(&'a str, Option<usize>)>(s: &'a str, delims: &[&str], f: F)
 ```
 
-The thresholds (`10000` for the product, `10` for the delimiter count) are heuristics — the source carries a `TODO: evaluate thresholds for switching between tokenizers`. They have not been benchmarked. Treat them as starting points, not as a tuned operating point.
+It calls `f` once per token, in order, with a **slice of the input** and the delimiter position. It allocates nothing itself; what the caller does with the slice is the caller's business. `tokenize` copies each slice into an owned `Token`; `split_and_store_multi` interns the slice directly and never materialises a `Token` at all.
 
-Callers can override the choice with `force_regex`:
+The scan works like this:
 
-- `None` — auto-detect.
-- `Some(true)` — force the regex tokenizer.
-- `Some(false)` — force the linear tokenizer.
+1. Build a `ScanTable`: a 256-entry `[ByteClass; 256]` where every byte that starts at least one non-empty delimiter is `DelimStart` and everything else is `Plain`. If no delimiter is usable the whole input is one token (or nothing, for empty input).
+2. Walk the input **byte by byte**. A `Plain` byte costs one table load and the cursor advances. Only a `DelimStart` byte runs the delimiter comparison loop (`starts_with` for each delimiter in slice order), so the O(n · m) inner loop of the old tokenizer only runs at candidate positions.
+3. On a match, emit the pending non-delimiter slice (if any), emit the delimiter slice, and move both the cursor and the pending-token start past the match.
 
-## Overlapping delimiters: the tokenizers are equivalent
+### Why stepping byte-wise is safe on UTF-8
 
-The two tokenizers are implemented differently but produce **identical output for every input**, including overlapping delimiters or delimiters that share a prefix. Both implement the same rule: at the leftmost position where any delimiter matches, the delimiter that appears earliest in the `delims` slice wins, and scanning resumes after it.
+A delimiter is valid UTF-8, so its first byte is never a continuation byte (`0x80..=0xBF`), and the table never marks a continuation byte as `DelimStart`. A match can therefore only start on a char boundary; because a delimiter consists of whole chars it also ends on one. Every slice the scanner takes is on char boundaries, and the bytes inside a multibyte char that are not match starts are simply skipped.
 
-- `tokenize` walks byte positions left to right and, at each one, takes the first delimiter in slice order that is a prefix of the remainder.
-- `tokenize_regex` compiles `escape(d0) | escape(d1) | ...` and relies on the `regex` crate's leftmost-first semantics, which for an alternation of literals means exactly the same thing: smallest start position first, then earliest alternative.
+### Cost
 
-A delimiter is a valid UTF-8 string, so a match inside a valid UTF-8 input always starts on a char boundary; the regex crate guarantees this as well. `tokenize` advances by whole chars when nothing matches, so the two never disagree on where a match may start either.
+Measured on one machine, release build, `tokenize`-style counting without token allocation, 11 single-char delimiters unless noted:
 
-The test `test_tokenizers_are_equivalent` checks this property on thousands of generated inputs over a tiny alphabet with deliberately overlapping, duplicated, and empty delimiters (`"ab"`/`"abc"`, `"a"`/`"aa"`, `"é"`/`"aé"`, `""`). An earlier version of this document hedged that the two might diverge on such input; they do not, and `force_regex` is purely a performance knob.
+| input | old linear | old regex | this scanner |
+|---|---|---|---|
+| 35 B | 1.4 µs | 11.8 µs | 0.03 µs |
+| 7 KB | 311 µs | 259 µs | 4.9 µs |
+| 4 KB, every other byte a delimiter | 240 µs | 300 µs | 4.0 µs |
+| 7 KB, one delimiter | 91 µs | – | 7.4 µs |
 
-Concretely, for `["ab", "abc"]` against `"xabcy"` both produce `["x", "ab", "cy"]`. If you want the longest delimiter to win instead, sort the delimiter slice longest-first before calling.
+An `aho-corasick` automaton was also evaluated (leftmost-first, same semantics): its per-call build cost 6–15 µs, which loses to this scanner at every size above, and only beats the old code on kilobyte inputs. The regex crate's compile alone cost ~12 µs per call. Both were dropped; the crate has no regex dependency any more.
 
-`tokenize_regex` falls back to `tokenize` if the regex crate refuses to compile the pattern (its compiled-size limit). Because the outputs are identical, callers cannot observe which implementation ran.
+## History: `tokenize_regex` and `force_regex`
+
+Until v0.3.11 there were two implementations: the char-by-char linear `tokenize` and a `tokenize_regex` that compiled `escape(d0) | escape(d1) | ...` per call, with `split_and_store_multi(s, delims, force_regex)` choosing between them by a size heuristic. The two always produced identical output (both were leftmost-first), so nothing observable changed when they were unified:
+
+- `tokenize_regex` is now an inline alias of `tokenize`, kept so the name still resolves.
+- `force_regex` is accepted and ignored, kept so the signature is stable.
+
+The original linear loop survives verbatim in the test module as `reference_tokenize`, the oracle for `test_scanner_matches_reference`, which checks the scanner against it on thousands of generated inputs over a tiny alphabet with overlapping, duplicated, empty and multibyte delimiters.
+
+## Extension point
+
+`ByteClass` is deliberately an enum rather than a bool. The structured-text scaffolding (`TextElement`, `StructuredLine`) will need splitting rules a literal alternation cannot express — character-class delimiters ("any whitespace"), repeated-character runs (`Character(_, n)`), and enclosures where inner delimiters must not split (`EnclosedElem`). Each of those is another `ByteClass` variant plus a branch in `scan_tokens`; the entry points and `Token` need not change. Per-token *recognition* (is this an IP address, a date, hex) is a separate step that runs on the emitted slices, not part of the scanner.
+
+If a caller ever needs a pattern-defined delimiter (a regex), the right shape is a new entry point that takes a caller-compiled `Regex`, not per-call compilation.
 
 ## Empty delimiter handling
 
-Both tokenizers skip empty entries in the `delims` slice without renumbering — `Token.delim_idx` continues to reference the original slice position. The reasoning:
-
-- `tokenize`: `s[i..].starts_with("")` is always true and would advance the cursor by zero, hanging the loop. The predicate `!d.is_empty() && s[i..].starts_with(d)` short-circuits the empty case.
-- `tokenize_regex`: an empty alternative in the alternation pattern matches zero-width everywhere and pollutes the output. The pattern is built from a filtered copy of `delims`; if every delimiter is empty (or `delims` is empty), the function short-circuits to a single non-delim token containing the entire input (or an empty vector for empty input).
+Empty entries in the `delims` slice are skipped without renumbering — `Token.delim_idx` continues to reference the original slice position. `starts_with("")` is always true and would advance the cursor by zero, hanging the loop, so the scanner both leaves empty delimiters out of the `ScanTable` and re-checks `!d.is_empty()` in the comparison loop. If every delimiter is empty (or `delims` is empty), the input is emitted as a single non-delimiter token, or nothing for empty input.
 
 The wrapper `split_and_store_multi` also stores `0` in `delim_indices` for empty delimiters, so the storage side of the API remains consistent.
 
 ## Relationship to the store
 
-The tokenizers themselves are pure — they do not depend on a `UniqueStrStore`. The store-aware wrappers (`split_and_store`, `split_and_store_multi`, `store_path`) take the resulting tokens and intern each one, returning a `Vec<u32>` of indices. The encoding of these index vectors (especially the use of `0` as a sentinel for "delimiter at boundary") is documented in `splitting-and-paths.md`.
+The scanner is pure — it does not depend on a `UniqueStrStore`. The store-aware wrappers (`split_and_store`, `split_and_store_multi`, `store_path`) intern each emitted part and return a `Vec<u32>` of indices. The encoding of these index vectors (especially the use of `0` as a sentinel for "delimiter at boundary") is documented in `splitting-and-paths.md`.

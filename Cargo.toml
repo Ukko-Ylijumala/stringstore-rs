@@ -19,7 +19,6 @@ size_of = ["dep:size-of"]
 
 [dependencies]
 parking_lot = "0.12"
-regex = "1.10"
 #size-of = { version = "0.1", optional = true }
 
 [dependencies.size-of]

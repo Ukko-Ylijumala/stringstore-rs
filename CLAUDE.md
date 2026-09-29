@@ -24,7 +24,7 @@ Single-file library crate. All public and internal types are in `src/lib.rs`. Ro
 | `StoredStrPtr` | Raw-pointer handle to an interned string (unsafe lifetime) |
 | `StoredStr<'a>` | Safe lifetime-tracked handle |
 | `CompactStr`, `Character`, `TextElement`, `StructuredLine`, `Hex`, `HexFormat`, `Integer` | **Dormant scaffolding** for a structured-text feature; not exported, not tested |
-| `tokenize`, `tokenize_regex`, `Token` | Tokenizers used by `split_and_store_multi` |
+| `ByteClass`, `ScanTable`, `scan_tokens`, `tokenize`, `tokenize_regex`, `Token` | The byte-class scanner and its entry points, used by `split_and_store_multi` (`tokenize_regex` is an alias of `tokenize`) |
 | `return_iso8859_1_cp` | Utility helper |
 | `StringStoreError`, `StringStoreResult` | Error types |
 | `mod tests` | Inline test module |
@@ -36,7 +36,7 @@ The design of the non-obvious bits lives in [`doc/design/`](doc/design/README.md
 - **[Storage architecture](doc/design/storage-architecture.md)** — the three-container split (`ascii` + `store` + `index`) and the load-bearing `LATIN1_NUM = 256` offset between public and internal indices. Required reading before touching anything index-related.
 - **[Concurrency model](doc/design/concurrency.md)** — RwLock + DashMap lock ordering and the post-lock recheck in `insert_unchecked`. Required reading before changing the insert path.
 - **[Unsafe pointer surface](doc/design/unsafe-pointers.md)** — `borrow_str`, `StoredStrPtr`, and the append-only invariant that keeps them sound. Required reading before adding any removal/mutation API.
-- **[Tokenization](doc/design/tokenization.md)** — two tokenizers, the dispatch heuristic, the empty-delimiter footgun, and the known divergence on overlapping delimiters.
+- **[Tokenization](doc/design/tokenization.md)** — the byte-class scanner, its leftmost-first contract, why byte-wise stepping is UTF-8 safe, the empty-delimiter footgun, and where richer tokenization rules should plug in.
 - **[Splitting and paths](doc/design/splitting-and-paths.md)** — sentinel-zero encoding shared by `split_and_store`, `store_path`, and `reconstruct`.
 
 ## Dependencies
