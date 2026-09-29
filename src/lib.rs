@@ -14,6 +14,7 @@ use std::{
     net::IpAddr, //Ipv4Addr, Ipv6Addr},
     ops::Deref,
     path::{Path, PathBuf},
+    ptr,
     str::{FromStr, Split},
     sync::{
         atomic::{AtomicU32, Ordering as AtomicOrdering},
@@ -764,7 +765,7 @@ NOTE: this pointer is only valid as long as the store is alive. The lifetime
 is not enforced, as the store is expected to outlive any references to its
 contents. This is the responsibility of the user of this struct to enforce.
 */
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Eq)]
 pub struct StoredStrPtr(*const str);
 
 impl StoredStrPtr {
@@ -791,6 +792,19 @@ impl Deref for StoredStrPtr {
 }
 
 /* --------------------------------- */
+
+/**
+Equality is by *content*, consistent with `Ord` and `Hash` (the previously
+derived impl compared pointer address + length, which disagreed with
+`cmp() == Equal` for equal strings living in two different stores).
+Within one store interning guarantees equal content <=> equal pointer,
+so the pointer comparison is a cheap fast path, not a semantic.
+*/
+impl PartialEq for StoredStrPtr {
+    fn eq(&self, other: &Self) -> bool {
+        ptr::eq(self.0, other.0) || self.as_str() == other.as_str()
+    }
+}
 
 impl PartialOrd for StoredStrPtr {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
@@ -1840,6 +1854,25 @@ mod tests {
             "get_unchecked({}) should == '{foo_s}'",
             start + 1
         );
+    }
+
+    #[test]
+    fn test_stored_str_ptr_eq_by_content() {
+        // `==`, `cmp` and `Hash` must agree; equal strings in two stores are equal.
+        let a: UniqueStrStore = UniqueStrStore::new();
+        let b: UniqueStrStore = UniqueStrStore::new();
+        let pa: StoredStrPtr = a.insert_or_get(HELLO).as_ptr();
+        let pa2: StoredStrPtr = a.insert_or_get(HELLO).as_ptr();
+        let pb: StoredStrPtr = b.insert_or_get(HELLO).as_ptr();
+        let other: StoredStrPtr = b.insert_or_get("other").as_ptr();
+
+        assert!(ptr::eq(pa.0, pa2.0), "same store must intern to the same pointer");
+        assert!(!ptr::eq(pa.0, pb.0), "different stores allocate separately");
+        assert_eq!(pa, pa2);
+        assert_eq!(pa, pb);
+        assert_eq!(pa.cmp(&pb), Ordering::Equal);
+        assert_ne!(pa, other);
+        assert_ne!(pa.cmp(&other), Ordering::Equal);
     }
 
     #[test]
