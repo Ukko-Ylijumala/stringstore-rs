@@ -132,15 +132,26 @@ assert_eq!(unsafe { store.borrow_str(foo_id) }, "foo");
 // check internal consistency
 store.validate_contents().expect("Store validation failed");
 */
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct UniqueStrStore(Arc<StoreInner>);
+
+/// Prints the public length and the arena (which lists every user string
+/// as `public index: "string"`); the ISO-8859-1 table and the raw hash
+/// index are left out, since neither is legible or informative.
+impl Debug for UniqueStrStore {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("UniqueStrStore")
+            .field("len", &self.len())
+            .field("store", &*self.0.store.read())
+            .finish()
+    }
+}
 
 /**
 The shared state behind a [UniqueStrStore]. All four fields live behind
 one `Arc`: a `Clone` is a single refcount increment and every access goes
 through one pointer instead of four separately allocated ones.
 */
-#[derive(Debug)]
 struct StoreInner {
     store: RwLock<StrArena>,
     index: DashMap<HashKey, u32, PreHashed>,
@@ -328,12 +339,14 @@ impl Index<usize> for StrArena {
     }
 }
 
-/// `Debug` helper: lists the arena's strings without collecting them.
+/// `Debug` helper: maps every arena string from its *public* index
+/// (`internal + LATIN1_NUM`) without collecting anything.
 struct StrArenaStrings<'a>(&'a StrArena);
 
 impl Debug for StrArenaStrings<'_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        f.debug_list().entries(self.0.iter()).finish()
+        let entries = self.0.iter().enumerate().map(|(i, s)| (i as u32 + LATIN1_NUM, s));
+        f.debug_map().entries(entries).finish()
     }
 }
 
@@ -1292,11 +1305,27 @@ impl<'a> From<StoredStr<'a>> for &'a str {
 NOTE: the dormant structured-text scaffolding below carries scoped
 `#[expect(dead_code)]` attributes instead of a crate-wide allow. The
 moment an item gets wired up, its attribute reports itself as an
-"unfulfilled lint expectation" — remove it then. The type definitions
+"unfulfilled lint expectation" — remove it then. Items that the tests
+already exercise (`StructuredLine` and the `with_store` formatting
+helpers) use `#[cfg_attr(not(test), expect(dead_code))]` so the
+expectation holds in both build configurations. The type definitions
 themselves need no attribute: rustc treats the `expect`-annotated impls
 and `TextElement` as live roots, which keeps the types they reference
 transitively live.
 */
+
+/**
+A value from the structured-text scaffolding paired with the
+[UniqueStrStore] its indices refer to, so that it can be formatted.
+
+`Display` recreates the text; `Debug` prints the index *and* the text
+(`CompactStr(256: "foo")`), which is what makes a dumped [StructuredLine]
+legible. Obtained through the `with_store` method of [CompactStr],
+[Character] and [TextElement]; [StructuredLine] carries its own store and
+implements both traits directly.
+*/
+#[cfg_attr(not(test), expect(dead_code))]
+struct WithStore<'a, T: ?Sized>(&'a T, &'a UniqueStrStore);
 
 /**
 A reference (index) to a stored string slice in a [UniqueStrStore].
@@ -1306,6 +1335,26 @@ hence it is only usable as a part of a larger structure with a reference.
 */
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CompactStr(u32);
+
+#[cfg_attr(not(test), expect(dead_code))]
+impl CompactStr {
+    /// Pair with `store` for `Display` / `Debug`; see [WithStore].
+    fn with_store<'a>(&'a self, store: &'a UniqueStrStore) -> WithStore<'a, Self> {
+        WithStore(self, store)
+    }
+}
+
+impl Display for WithStore<'_, CompactStr> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str(self.0.get(self.1))
+    }
+}
+
+impl Debug for WithStore<'_, CompactStr> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "CompactStr({}: {:?})", self.0.idx(), self.0.get(self.1))
+    }
+}
 
 #[expect(dead_code)]
 impl CompactStr {
@@ -1326,6 +1375,30 @@ impl CompactStr {
 /// This is a single or repeated character stored in a [UniqueStrStore].
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Character(CompactStr, u8);
+
+#[cfg_attr(not(test), expect(dead_code))]
+impl Character {
+    /// Pair with `store` for `Display` / `Debug`; see [WithStore].
+    fn with_store<'a>(&'a self, store: &'a UniqueStrStore) -> WithStore<'a, Self> {
+        WithStore(self, store)
+    }
+}
+
+impl Display for WithStore<'_, Character> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let s: &str = self.0.get(self.1);
+        for _ in 0..self.0.num() {
+            f.write_str(s)?;
+        }
+        Ok(())
+    }
+}
+
+impl Debug for WithStore<'_, Character> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "Character({}: {:?} x{})", self.0.idx(), self.0.get(self.1), self.0.num())
+    }
+}
 
 #[expect(dead_code)]
 impl Character {
@@ -1401,18 +1474,130 @@ enum TextElement<I: Integer = i64> {
     //Duration,
 }
 
+#[cfg_attr(not(test), expect(dead_code))]
+impl<I: Integer> TextElement<I> {
+    /// Pair with `store` for `Display` / `Debug`; see [WithStore].
+    fn with_store<'a>(&'a self, store: &'a UniqueStrStore) -> WithStore<'a, Self> {
+        WithStore(self, store)
+    }
+}
+
+/**
+Recreates the element's text. This is a *canonical* rendering: the sketch
+does not record the original spelling of composite elements (the `=` of a
+`KeyVal`, the whitespace inside a `Sentence`, number formatting), so the
+result reads correctly but is not guaranteed byte-identical to the input.
+*/
+impl<I: Integer> Display for WithStore<'_, TextElement<I>> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let store: &UniqueStrStore = self.1;
+        // write a list of stored strings with `sep` between them
+        let join = |f: &mut Formatter<'_>, parts: &[CompactStr], sep: &str| -> fmt::Result {
+            for (i, part) in parts.iter().enumerate() {
+                if i > 0 {
+                    f.write_str(sep)?;
+                }
+                f.write_str(part.get(store))?;
+            }
+            Ok(())
+        };
+
+        match self.0 {
+            TextElement::Delimiter(c) | TextElement::Char(c) => write!(f, "{}", c.with_store(store)),
+            TextElement::Word(w) | TextElement::Hostname(w) => f.write_str(w.get(store)),
+            TextElement::KeyVal(k, v) => write!(f, "{}={}", k.get(store), v.get(store)),
+            TextElement::Integer(i) => write!(f, "{i}"),
+            TextElement::Float(x) => write!(f, "{x}"),
+            TextElement::Range(a, b, marker) => write!(f, "{a}{}{b}", marker.with_store(store)),
+            TextElement::Day(y, m, d) => write!(f, "{y:04}-{m:02}-{d:02}"),
+            TextElement::Time(h, m, sec) => write!(f, "{h:02}:{m:02}:{sec:02}"),
+            TextElement::Timestamp(t) => write!(f, "{t}"),
+            TextElement::IPAddress(ip) => write!(f, "{ip}"),
+            TextElement::Username(u, host) => write!(f, "{}@{}", u.get(store), host.get(store)),
+            TextElement::Email(u, domain) => write!(f, "{}@{}", u.get(store), domain.get(store)),
+            TextElement::HexStr(hex, fmt) => f.write_str(&Hex::to_string(*hex, *fmt)),
+            TextElement::Sentence(words) => join(f, words, " "),
+            TextElement::URLStr(parts) => join(f, parts, ""),
+            TextElement::URLParams(params) => {
+                f.write_str("?")?;
+                join(f, params, "&")
+            }
+            TextElement::EnclosedElem(inner, open, close) => {
+                write!(f, "{}{}{}", open.get(store), inner.with_store(store), close.get(store))
+            }
+            TextElement::RawText(s) => f.write_str(s),
+        }
+    }
+}
+
+/// Like the derived `Debug`, but every stored-string field shows its
+/// text next to its index (`Word(CompactStr(256: "foo"))`).
+impl<I: Integer> Debug for WithStore<'_, TextElement<I>> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let store: &UniqueStrStore = self.1;
+        // a Vec<CompactStr> field, resolved
+        let list = |parts: &[CompactStr]| -> Vec<String> {
+            parts.iter().map(|p| format!("{:?}", p.with_store(store))).collect()
+        };
+
+        match self.0 {
+            TextElement::Delimiter(c) => f.debug_tuple("Delimiter").field(&c.with_store(store)).finish(),
+            TextElement::Char(c) => f.debug_tuple("Char").field(&c.with_store(store)).finish(),
+            TextElement::Word(w) => f.debug_tuple("Word").field(&w.with_store(store)).finish(),
+            TextElement::KeyVal(k, v) => f
+                .debug_tuple("KeyVal")
+                .field(&k.with_store(store))
+                .field(&v.with_store(store))
+                .finish(),
+            TextElement::Integer(i) => f.debug_tuple("Integer").field(i).finish(),
+            TextElement::Float(x) => f.debug_tuple("Float").field(x).finish(),
+            TextElement::Range(a, b, marker) => f
+                .debug_tuple("Range")
+                .field(a)
+                .field(b)
+                .field(&marker.with_store(store))
+                .finish(),
+            TextElement::Day(y, m, d) => f.debug_tuple("Day").field(y).field(m).field(d).finish(),
+            TextElement::Time(h, m, sec) => f.debug_tuple("Time").field(h).field(m).field(sec).finish(),
+            TextElement::Timestamp(t) => f.debug_tuple("Timestamp").field(&format_args!("{t}")).finish(),
+            TextElement::IPAddress(ip) => f.debug_tuple("IPAddress").field(ip).finish(),
+            TextElement::Hostname(h) => f.debug_tuple("Hostname").field(&h.with_store(store)).finish(),
+            TextElement::Username(u, host) => f
+                .debug_tuple("Username")
+                .field(&u.with_store(store))
+                .field(&host.with_store(store))
+                .finish(),
+            TextElement::Email(u, domain) => f
+                .debug_tuple("Email")
+                .field(&u.with_store(store))
+                .field(&domain.with_store(store))
+                .finish(),
+            TextElement::HexStr(hex, fmt) => f.debug_tuple("HexStr").field(hex).field(fmt).finish(),
+            TextElement::Sentence(words) => f.debug_tuple("Sentence").field(&list(words)).finish(),
+            TextElement::URLStr(parts) => f.debug_tuple("URLStr").field(&list(parts)).finish(),
+            TextElement::URLParams(params) => f.debug_tuple("URLParams").field(&list(params)).finish(),
+            TextElement::EnclosedElem(inner, open, close) => f
+                .debug_tuple("EnclosedElem")
+                .field(&inner.with_store(store))
+                .field(&open.with_store(store))
+                .field(&close.with_store(store))
+                .finish(),
+            TextElement::RawText(s) => f.debug_tuple("RawText").field(s).finish(),
+        }
+    }
+}
+
 /* --------------------------------- */
 
 /// A unit of structured text, which can be a line or a block.
 /// Contains a reference to the [UniqueStrStore] for string retrieval.
-#[expect(dead_code)]
-#[derive(Debug)]
+#[cfg_attr(not(test), expect(dead_code))]
 struct StructuredLine {
     elems: Vec<TextElement>,
     store: Arc<UniqueStrStore>,
 }
 
-#[expect(dead_code)]
+#[cfg_attr(not(test), expect(dead_code))]
 impl StructuredLine {
     fn new(store: &Arc<UniqueStrStore>) -> Self {
         Self {
@@ -1433,6 +1618,28 @@ impl StructuredLine {
 impl PartialEq for StructuredLine {
     fn eq(&self, other: &Self) -> bool {
         self.elems == other.elems
+    }
+}
+
+/// Recreates the line by concatenating its elements (canonical rendering,
+/// see [TextElement]'s `Display`).
+impl Display for StructuredLine {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        for elem in &self.elems {
+            write!(f, "{}", elem.with_store(&self.store))?;
+        }
+        Ok(())
+    }
+}
+
+/// Lists the elements with their strings resolved; the store itself is
+/// not printed (it may hold millions of strings).
+impl Debug for StructuredLine {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str("StructuredLine ")?;
+        f.debug_list()
+            .entries(self.elems.iter().map(|e| e.with_store(&self.store)))
+            .finish()
     }
 }
 
@@ -1596,6 +1803,13 @@ impl Token {
     #[inline]
     pub fn delim_idx(&self) -> Option<usize> {
         self.delim_idx
+    }
+}
+
+/// The token's text, delimiter or not.
+impl Display for Token {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.content)
     }
 }
 
@@ -2564,6 +2778,66 @@ mod tests {
         assert_eq!(tokens[1].content(), ",");
         assert!(tokens[1].is_delim());
         assert_eq!(tokens[1].delim_idx(), Some(0));
+    }
+
+    #[test]
+    fn test_store_debug_is_legible() {
+        let store: UniqueStrStore = UniqueStrStore::new();
+        let idx: u32 = store.insert("foo");
+        let dbg: String = format!("{store:?}");
+        assert!(dbg.contains(&format!("{idx}: \"foo\"")), "{dbg}");
+        assert!(dbg.contains("len: 257"), "{dbg}");
+        assert!(!dbg.contains("\"A\""), "ISO-8859-1 table must not be dumped: {dbg}");
+    }
+
+    #[test]
+    fn test_token_display() {
+        let tokens: Vec<Token> = tokenize("a,b", &[","]);
+        let joined: String = tokens.iter().map(Token::to_string).collect();
+        assert_eq!(joined, "a,b");
+    }
+
+    #[rustfmt::skip]
+    #[test]
+    fn test_structured_line_display_and_debug() {
+        let store: Arc<UniqueStrStore> = UniqueStrStore::new().shared();
+        let word = |s: &str| CompactStr(store.insert(s));
+        let ch = |s: &str, n: u8| Character(CompactStr(store.insert(s)), n);
+        let mut line: StructuredLine = StructuredLine::new(&store);
+
+        line.push(TextElement::Word(word("Mary")));
+        line.push(TextElement::Delimiter(ch(" ", 1)));
+        line.push(TextElement::KeyVal(word("had"), word("lamb")));
+        line.push(TextElement::Delimiter(ch(" ", 2)));
+        line.push(TextElement::Integer(-42));
+        line.push(TextElement::Char(ch("*", 3)));
+        line.push(TextElement::Range(0, 100, ch("-", 1)));
+        line.push(TextElement::Day(2026, 9, 29));
+        line.push(TextElement::Time(7, 5, 0));
+        line.push(TextElement::IPAddress("10.0.0.1".parse().unwrap()));
+        line.push(TextElement::Email(word("john"), word("example.org")));
+        line.push(TextElement::HexStr(Hex(0xfeedf00d), HexFormat::PREFIX));
+        line.push(TextElement::Sentence(vec![word("a"), word("little")]));
+        line.push(TextElement::URLParams(vec![word("x=1"), word("y=2")]));
+        line.push(TextElement::EnclosedElem(
+            Box::new(TextElement::Word(word("inner"))), word("("), word(")"),
+        ));
+        line.push(TextElement::RawText("raw".to_string()));
+
+        assert_eq!(
+            line.to_string(),
+            "Mary had=lamb  -42***0-1002026-09-2907:05:0010.0.0.1john@example.org0xfeedf00da little?x=1&y=2(inner)raw"
+        );
+        assert_eq!(line.len(), 16);
+
+        let dbg: String = format!("{line:?}");
+        let mary: u32 = store.idx("Mary").unwrap();
+        assert!(dbg.starts_with("StructuredLine ["), "{dbg}");
+        assert!(dbg.contains(&format!("Word(CompactStr({mary}: \"Mary\"))")), "{dbg}");
+        assert!(dbg.contains("Delimiter(Character(32: \" \" x2))"), "{dbg}");
+        assert!(dbg.contains("Integer(-42)"), "{dbg}");
+        assert!(dbg.contains("EnclosedElem(Word(CompactStr("), "{dbg}");
+        assert!(!dbg.contains("UniqueStrStore"), "store must not be dumped: {dbg}");
     }
 
     #[test]
