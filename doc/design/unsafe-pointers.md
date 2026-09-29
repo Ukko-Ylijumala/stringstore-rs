@@ -26,10 +26,22 @@ The returned `*const str` is then handed back as `&'a str` (in `borrow_str`) or 
 
 This is sound because the pointer addresses **bytes inside an arena chunk owned by the `StrArena`**, not the slot vector's buffer:
 
-- The slot `Vec<*const str>` and the chunk list `Vec<Box<[u8]>>` may reallocate their buffers when growing. That moves the slots and the `Box` *handles* — but the chunk bytes stay where they are on the heap.
+- The slot `Vec<*const str>` and the chunk lists (`Vec<*mut [u8]>`) may reallocate their buffers when growing. That moves the slots and the chunk *pointers* — but the chunk bytes stay where they are on the heap.
 - A chunk is never resized, moved or dropped while the store is alive, because **the store never removes, replaces, or shrinks**. Once a string is copied into a chunk, that chunk lives until the entire `UniqueStrStore` is dropped.
 
 (Before the arena the same argument held with one `Box<str>` per string; the shape of the invariant is unchanged.)
+
+### Why the chunks are raw pointers, not `Box<[u8]>`
+
+Address stability is not enough: the pointers also must not be invalidated by Rust's aliasing rules. A `Box<[u8]>`, and any `&mut [u8]` taken through it, asserts exclusive access to *every* byte of the chunk. Up to v0.4.0 the arena held `Box<[u8]>` chunks and appended through `chunks.last_mut()`, which borrows the whole chunk mutably; that invalidated every `&str` already handed out into the chunk. The oversized path took a pointer from a fresh `Box` and then moved the `Box` into its list, which invalidated that pointer too. Miri's default model (Stacked Borrows) reported both as undefined behavior on the existing tests; Tree Borrows accepted them, and no miscompile was observed.
+
+`StrArena` now holds each chunk as the raw pointer `Box::into_raw` returns, appends with `ptr::copy_nonoverlapping` into the unfilled tail, derives each slot from that raw pointer, and turns the chunks back into `Box`es only in `Drop`. Once a slot points into a chunk, no reference to that chunk as a whole is ever created again.
+
+Check any change in this area under Miri (nightly `miri` component; slow — the two skipped tests insert 100k strings each):
+
+```sh
+cargo +nightly miri test -- --skip test_concurrent_inserts --skip test_competing_inserts
+```
 
 The borrow checker is satisfied for `borrow_str` because the returned `&'a str` is reborrowed through `&'a self`, so Rust treats it as having the store's lifetime.
 
@@ -39,7 +51,7 @@ The soundness story above relies entirely on these invariants:
 
 1. **No removal.** No `remove`, `pop`, `clear`, `truncate`, `shrink_to_fit`, `drain`, or any other operation that would drop or shrink an arena chunk before the store itself.
 2. **No replacement.** No method that rewrites a slot or reuses chunk bytes, which would invalidate any outstanding pointer to the old contents.
-3. **No interior mutation of stored strings.** Chunk bytes are written exactly once, inside `StrArena::push`, before the slot is published; preserve this. Do not introduce anything that exposes `&mut str` or `&mut [u8]` into a chunk after that.
+3. **No interior mutation of stored strings.** Chunk bytes are written exactly once, inside `StrArena::push`, through a raw pointer, before the slot is published; preserve this. Do not introduce anything that creates a `&mut str` or `&mut [u8]` into a chunk, or a `Box` of one before `Drop` — not even transiently to write the unfilled tail (see above).
 
 If any of these need to change, the unsafe APIs must be rethought from scratch — most likely by switching to reference-counted slots or by making the unsafe APIs require an explicit guard type that ties the pointer's lifetime to the read lock.
 

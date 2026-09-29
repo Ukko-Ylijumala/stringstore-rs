@@ -12,6 +12,7 @@ Standard Cargo workflow. The crate is `publish = false` and intended for consump
 - Test with the optional memory-accounting feature: `cargo test --features size_of`
 - Test with 128-bit index keys: `cargo test --features xxh128` (the full matrix is `""`, `xxh128`, `size_of`, `xxh128,size_of`; clippy the same way)
 - Lint: `cargo clippy --all-targets`
+- Unsafe check: `cargo +nightly miri test -- --skip test_concurrent_inserts --skip test_competing_inserts` (needs the nightly `miri` component; slow). Required after touching `StrArena` or the insert path; see `doc/design/unsafe-pointers.md`.
 
 Tests live inline at the bottom of `src/lib.rs` under `mod tests` — there is no `tests/` directory.
 

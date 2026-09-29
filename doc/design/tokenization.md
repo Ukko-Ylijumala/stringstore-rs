@@ -26,7 +26,7 @@ For overlapping delimiters this means order matters: `["ab", "abc"]` against `"x
 fn scan_tokens<'a, F: FnMut(&'a str, Option<usize>)>(s: &'a str, delims: &[&str], f: F)
 ```
 
-It calls `f` once per token, in order, with a **slice of the input** and the delimiter position. It allocates nothing itself; what the caller does with the slice is the caller's business. `tokenize` copies each slice into an owned `Token`; `split_and_store_multi` interns the slice directly and never materialises a `Token` at all.
+It calls `f` once per token, in order, with a **slice of the input** and the delimiter position. It allocates nothing itself; what the caller does with the slice is the caller's business. `tokenize` copies each slice into an owned `Token`; `split_and_store_multi` interns each non-delimiter slice directly, reuses the index it already interned for the matched delimiter (the scanner reports which one), and never materialises a `Token` at all.
 
 The scan works like this:
 

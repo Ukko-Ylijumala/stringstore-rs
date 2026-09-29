@@ -25,7 +25,7 @@ length:                len: AtomicU32  // public length, starts at 256
 
 ## String bytes: the arena
 
-`StrArena` copies each new string to the end of the current chunk, a `Box<[u8]>` of `chunk_size` bytes (`ARENA_CHUNK_SIZE` = 128 KiB by default, overridable per store through `new_with_capacity(capacity, chunk_size)`). When the string does not fit in what is left, a fresh chunk is started; the unused tail of the old one is wasted, bounded by one string length per chunk. A string longer than a whole chunk gets an exact-size chunk of its own in a separate `oversized` list, so the current chunk keeps filling. Chunks are never resized, moved or freed until the arena drops. The slot for each string is a fat pointer into its chunk, so a read is one load — identical cost to the old `Box<str>` deref.
+`StrArena` copies each new string to the end of the current chunk, a heap allocation of `chunk_size` bytes owned through a raw pointer (`ARENA_CHUNK_SIZE` = 128 KiB by default, overridable per store through `new_with_capacity(capacity, chunk_size)`, which clamps it to 1 byte – 1 GiB). Why raw pointers and not `Box<[u8]>` is in `unsafe-pointers.md`. When the string does not fit in what is left, a fresh chunk is started; the unused tail of the old one is wasted, bounded by one string length per chunk. A string longer than a whole chunk gets an exact-size chunk of its own in a separate `oversized` list, so the current chunk keeps filling. Chunks are never resized, moved or freed until the arena drops. The slot for each string is a fat pointer into its chunk, so a read is one load — identical cost to the old `Box<str>` deref.
 
 Why: one `malloc` per string was the dominant memory cost for short strings. glibc's smallest block is 32 bytes, so a 9-byte string cost 32 bytes of heap plus its 16-byte slot. Measured with 2M strings per row (500k for the long row), release build, glibc, resident-set growth including the slot vector:
 
@@ -60,7 +60,7 @@ Translation points to watch:
 
 - `idx()`: returns `self.index.get(...).map(|r| r.value() + LATIN1_NUM)` — DashMap value is internal, add the offset for the public answer.
 - `lookup(idx)` / `get_str_ptr(idx)`: branch on `idx < LATIN1_NUM`. If yes, hit `ascii[idx]` directly. If no, take the read lock and index into `store[idx - LATIN1_NUM]`. `lookup` is the bounds-checked form (`get`, `borrow_str`) and takes the lock exactly once; `get_str_ptr` is the unchecked form for callers that already hold a valid index (`get_ptr`, `StoredStr`).
-- `insert_unchecked`: `let idx: u32 = store.len() as u32;` is internal; the return value is `indexed + LATIN1_NUM`.
+- `insert_unchecked`: the looked-up `indexed` and the new `let idx: u32 = store.len() as u32;` are internal; both return paths add `LATIN1_NUM`.
 - `reconstruct`: same branch as `lookup` when fetching each part, under one read lock for the whole rebuild.
 
 ## Why the split exists

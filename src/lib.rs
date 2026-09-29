@@ -4,7 +4,7 @@
 use custom_xxh3::hash_bytes;
 #[cfg(feature = "xxh128")]
 use xxhash_rust::xxh3::xxh3_128;
-use dashmap::DashMap;
+use dashmap::{mapref::entry::Entry, DashMap};
 use miniutils::normalize_path;
 use parking_lot::RwLock;
 use std::{
@@ -38,6 +38,12 @@ const MAX_USER_STRINGS: usize = (u32::MAX - LATIN1_NUM) as usize;
 /// the wasted tail per chunk is negligible, and small enough that a store
 /// with a handful of strings does not reserve much.
 pub const ARENA_CHUNK_SIZE: usize = 128 * 1024;
+/**
+Upper bound of the arena chunk size; `new_with_capacity` clamps larger
+requests to it. A bigger chunk saves nothing, and one over `isize::MAX`
+bytes cannot be allocated at all.
+*/
+const MAX_ARENA_CHUNK_SIZE: usize = 1 << 30;
 
 /**
 The index key: an xxh3 digest of the string bytes.
@@ -217,10 +223,10 @@ impl SizeOf for PreHashed {
 /**
 Append-only bump arena holding the bytes of every user-inserted string.
 
-Strings are copied back to back into fixed-size chunks (`Box<[u8]>`) that
-are never resized, moved or freed until the arena is dropped; a string
-longer than a chunk gets a dedicated chunk of exactly its own size. One
-fat pointer per string, in internal index order, lives in `slots`.
+Strings are copied back to back into fixed-size heap chunks that are
+never resized, moved or freed until the arena is dropped; a string longer
+than a chunk gets a dedicated chunk of exactly its own size. One fat
+pointer per string, in internal index order, lives in `slots`.
 
 Compared to one `Box<str>` per string this removes the allocator's
 per-allocation overhead (glibc's smallest block is 32 bytes, so a 9-byte
@@ -230,14 +236,23 @@ section, and makes drop O(chunks) instead of O(strings). Measurements are
 in `doc/design/storage-architecture.md`.
 
 The pointer-stability argument in `doc/design/unsafe-pointers.md` keeps
-its shape: `chunks` may reallocate as it grows, which moves the `Box`
-handles but never the bytes they own.
+its shape: `chunks` may reallocate as it grows, which moves the chunk
+pointers but never the bytes they point at.
+
+A chunk is owned through the raw pointer `Box::into_raw` returns (freed
+in `Drop`), never as a `Box<[u8]>`. A `Box`, and any `&mut [u8]` taken
+through it, asserts exclusive access to the whole chunk: moving the `Box`
+or borrowing the chunk mutably to append a string would invalidate every
+`&str` already handed out into it (Miri's Stacked Borrows flags exactly
+that). Appends therefore write through a raw pointer, to the unfilled
+tail only.
 */
 struct StrArena {
-    /// bump chunks of `chunk_size` bytes; the last one is being filled
-    chunks: Vec<Box<[u8]>>,
-    /// exact-size chunks for strings longer than `chunk_size`
-    oversized: Vec<Box<[u8]>>,
+    /// bump chunks of `chunk_size` bytes, each from `Box::into_raw` and
+    /// freed in `Drop`; the last one is being filled
+    chunks: Vec<*mut [u8]>,
+    /// exact-size chunks for strings longer than `chunk_size` (same ownership)
+    oversized: Vec<*mut [u8]>,
     /// bytes used in the last element of `chunks`
     cursor: usize,
     chunk_size: usize,
@@ -246,9 +261,10 @@ struct StrArena {
 }
 
 /*
-SAFETY: every pointer in `slots` addresses bytes owned by a chunk in the
-same struct. The bytes are written once, under `&mut self`, before the
-pointer is published, and are freed only when the whole arena drops.
+SAFETY: every chunk pointer is a unique allocation owned by this struct,
+and every pointer in `slots` addresses bytes inside one of those chunks.
+The bytes are written once, under `&mut self`, before the pointer is
+published, and are freed only when the whole arena drops.
 Sharing a `StrArena` across threads (behind the store's `RwLock`) is
 therefore no different from sharing a `Vec<Box<str>>`.
 */
@@ -261,7 +277,7 @@ impl StrArena {
             chunks: Vec::new(),
             oversized: Vec::new(),
             cursor: 0,
-            chunk_size: chunk_size.max(1),
+            chunk_size: chunk_size.clamp(1, MAX_ARENA_CHUNK_SIZE),
             slots: Vec::with_capacity(slots),
         }
     }
@@ -272,30 +288,72 @@ impl StrArena {
         self.slots.len()
     }
 
-    /// Copy `s` into the arena and append its slot.
+    /// Whether an `n`-byte string (not an oversized one) needs a fresh chunk.
+    #[inline]
+    fn needs_chunk(&self, n: usize) -> bool {
+        self.chunks.is_empty() || self.cursor + n > self.chunk_size
+    }
+
+    /// Start a fresh bump chunk; the unused tail of the previous one is abandoned.
+    fn new_chunk(&mut self) {
+        let chunk: Box<[u8]> = vec![0u8; self.chunk_size].into_boxed_slice();
+        self.chunks.push(Box::into_raw(chunk));
+        self.cursor = 0;
+    }
+
+    /**
+    Make room for one more string of `n` bytes. Every step of an append
+    that can fail (slot vector growth, a new chunk) runs here, so that the
+    `push` after it cannot unwind; see `push`. Reserving without pushing is
+    harmless: room is only used up by `push`.
+    */
+    fn reserve(&mut self, n: usize) {
+        self.slots.reserve(1);
+        if n > self.chunk_size {
+            self.oversized.reserve(1);
+        } else if self.needs_chunk(n) {
+            self.new_chunk();
+        }
+    }
+
+    /**
+    Copy `s` into the arena and append its slot.
+
+    After `reserve(s.len())` this neither grows a `Vec` nor allocates a
+    chunk. The one allocation left is the exact-size chunk of an oversized
+    string, which cannot unwind: a `&str` is at most `isize::MAX` bytes,
+    so its layout is valid, and a failed allocation aborts. Without the
+    reserve it still works, it just may allocate (and so fail) itself.
+    */
     fn push(&mut self, s: &str) {
         let n: usize = s.len();
 
         if n > self.chunk_size {
-            // does not fit any chunk: give it an allocation of its own
-            let chunk: Box<[u8]> = s.as_bytes().into();
-            // SAFETY: the bytes are a verbatim copy of a `&str`
-            let ptr: *const str = unsafe { str::from_utf8_unchecked(&chunk) } as *const str;
+            // does not fit any chunk: give it an allocation of its own,
+            // whose bytes are a verbatim copy of a `&str` (valid UTF-8)
+            let chunk: *mut [u8] = Box::into_raw(Box::<[u8]>::from(s.as_bytes()));
             self.oversized.push(chunk);
-            self.slots.push(ptr);
+            self.slots.push(chunk.cast_const() as *const str);
             return;
         }
 
-        if self.chunks.is_empty() || self.cursor + n > self.chunk_size {
-            self.chunks.push(vec![0u8; self.chunk_size].into_boxed_slice());
-            self.cursor = 0;
+        if self.needs_chunk(n) {
+            // `reserve` has normally done this already
+            self.new_chunk();
         }
         let start: usize = self.cursor;
-        let chunk: &mut [u8] = self.chunks.last_mut().expect("a chunk was just ensured");
-        let dst: &mut [u8] = &mut chunk[start..start + n];
-        dst.copy_from_slice(s.as_bytes());
-        // SAFETY: `dst` was just filled from a `&str`, so it is valid UTF-8
-        let ptr: *const str = unsafe { str::from_utf8_unchecked(dst) } as *const str;
+        let base: *mut u8 = self.chunks.last().expect("a chunk was just ensured").cast::<u8>();
+        /*
+        SAFETY: `start + n <= chunk_size`, so the destination lies inside
+        the chunk, past every published slot. Only the raw pointer is
+        used, so no reference to the chunk exists that could invalidate
+        those slots. The copied bytes come from a `&str`: valid UTF-8.
+        */
+        let ptr: *const str = unsafe {
+            let dst: *mut u8 = base.add(start);
+            ptr::copy_nonoverlapping(s.as_ptr(), dst, n);
+            ptr::slice_from_raw_parts(dst.cast_const(), n) as *const str
+        };
         self.cursor = start + n;
         self.slots.push(ptr);
     }
@@ -327,6 +385,15 @@ impl StrArena {
     /// Total bytes of string payload stored.
     fn bytes_used(&self) -> usize {
         self.iter().map(str::len).sum()
+    }
+}
+
+impl Drop for StrArena {
+    fn drop(&mut self) {
+        for &chunk in self.chunks.iter().chain(&self.oversized) {
+            // SAFETY: each chunk came from `Box::into_raw` and is freed only here
+            drop(unsafe { Box::from_raw(chunk) });
+        }
     }
 }
 
@@ -380,7 +447,7 @@ impl SizeOf for StrArena {
         ] {
             if cap > 0 {
                 context
-                    .add_vectorlike(len, cap, size_of::<Box<[u8]>>())
+                    .add_vectorlike(len, cap, size_of::<*mut [u8]>())
                     .add_distinct_allocation();
             }
         }
@@ -413,6 +480,7 @@ impl UniqueStrStore {
     [ARENA_CHUNK_SIZE] is the default). A string longer than `chunk_size`
     gets an allocation of its own, so any size works; a chunk size below
     the typical string length just degrades to one allocation per string.
+    `chunk_size` is clamped to `1..=1 GiB`.
     */
     pub fn new_with_capacity(capacity: usize, chunk_size: usize) -> Self {
         // Make the ISO-8859-1 codepoint Vec. Its first element
@@ -539,8 +607,8 @@ impl UniqueStrStore {
     checker complain of "cannot return value referencing local variable".
 
     This is safe because we're returning a pointer to string bytes inside an
-    arena chunk, which never move, while the chunk's owning [Box] handle
-    (and the slot vector) may be moved around.
+    arena chunk, which never move, while the chunk pointers (and the slot
+    vector) may be moved around.
 
     This should work too, but is more complicated:
     ```ignore
@@ -618,20 +686,39 @@ impl UniqueStrStore {
         // next free index
         let idx: u32 = len as u32;
 
-        // atomic get or insert
-        let indexed: u32 = *self.0.index.entry(key).or_insert(idx);
-        if indexed == idx {
-            // we did in fact insert a new string: copy it into the arena
-            // (no per-string allocation; a new chunk only every 128 KiB)
-            store.push(s);
-            self.0.len.fetch_add(1, AtomicOrdering::Release);
-        } else {
-            // someone else interned this hash first: make sure it is
-            // actually the same string and not a hash collision
-            #[cfg(not(feature = "xxh128"))]
-            verify_hit(&store, indexed, s);
+        /*
+        Do everything that can fail (slot growth, a new chunk) before the
+        entry is published below. From then on nothing may unwind until the
+        push is done, or the entry would point at a slot that never gets
+        pushed. See `doc/design/concurrency.md` for why the entry is not
+        simply published after the push instead.
+        */
+        store.reserve(s.len());
+
+        // atomic recheck: another thread may have interned this hash since
+        // the caller's lookup
+        match self.0.index.entry(key) {
+            Entry::Vacant(vacant) => {
+                /*
+                Publish, then copy into the room reserved above. A reader
+                that finds the entry first still waits for the copy: every
+                slot read takes the store lock, which we hold until then.
+                */
+                vacant.insert(idx);
+                store.push(s);
+                self.0.len.fetch_add(1, AtomicOrdering::Release);
+                Ok(idx + LATIN1_NUM)
+            }
+            Entry::Occupied(hit) => {
+                // someone else interned this hash first: make sure it is
+                // actually the same string and not a hash collision
+                let indexed: u32 = *hit.get();
+                drop(hit);
+                #[cfg(not(feature = "xxh128"))]
+                verify_hit(&store, indexed, s);
+                Ok(indexed + LATIN1_NUM)
+            }
         }
-        Ok(indexed + LATIN1_NUM)
     }
 
     /// Core insert logic shared by `insert` and `try_insert`. Borrows only —
@@ -781,7 +868,8 @@ impl UniqueStrStore {
     First, the delimiters provided in `delims` are stored, then the string
     `s` is split based on these delimiters by the byte-class scanner (see
     `doc/design/tokenization.md`) and each part is stored and its index
-    returned. The parts are interned straight from slices of `s`; no
+    returned. The parts are interned straight from slices of `s`, and a
+    delimiter token reuses the index its delimiter got above; no
     intermediate [Token]s are allocated.
 
     ## Arguments
@@ -834,7 +922,13 @@ impl UniqueStrStore {
             return (vec![self.insert(s)], vec![]);
         }
 
-        scan_tokens(s, delims, |token: &str, _| result.push(self.insert(token)));
+        // a delimiter token is exactly `delims[d]`, already interned above
+        scan_tokens(s, delims, |token: &str, delim: Option<usize>| {
+            result.push(match delim {
+                Some(d) => delim_indices[d],
+                None => self.insert(token),
+            })
+        });
 
         (result, delim_indices)
     }
@@ -2100,6 +2194,7 @@ impl StringStoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
 
     const HELLO: &str = "Hello, world!";
     const CONC_S_NUM: usize = 100_000;
@@ -2381,6 +2476,8 @@ mod tests {
         Tiny chunks so strings straddle many chunk boundaries, plus strings
         longer than a chunk, which get a dedicated allocation. Pointers
         handed out before the arena grew must stay valid and identical.
+        Under Miri this also checks that appending to a chunk does not
+        invalidate the strings already in it.
         */
         let store: UniqueStrStore = UniqueStrStore::new_with_capacity(8, 16);
         let strs: Vec<String> = (0..500).map(|i| format!("s{i}-{}", "x".repeat(i % 40))).collect();
@@ -2405,6 +2502,58 @@ mod tests {
         assert_eq!(store.get(after).unwrap(), "after-the-big-one");
         assert_eq!(store.insert(&big), big_id);
         store.validate_contents().ok();
+    }
+
+    #[test]
+    fn test_failed_append_publishes_nothing() {
+        /*
+        The index entry is published before the push, and the chunk used
+        to be allocated inside the push. A panic there (here a chunk that
+        cannot be sized) left an entry pointing at a missing slot, and a
+        safe `get_ref` then read out of bounds. The chunk size is set past
+        the constructor's clamp to force the panic.
+        */
+        let store: UniqueStrStore = UniqueStrStore::new();
+        store.0.store.write().chunk_size = usize::MAX;
+        let res = catch_unwind(AssertUnwindSafe(|| store.insert(HELLO)));
+        assert!(res.is_err(), "the chunk allocation should have panicked");
+
+        assert_eq!(store.len(), LATIN1_NUM as usize);
+        assert_eq!(store.idx(HELLO), None, "no entry may outlive a failed push");
+        assert!(store.get_ref(HELLO).is_none());
+        store.validate_contents().ok();
+
+        // the store stays usable
+        store.0.store.write().chunk_size = ARENA_CHUNK_SIZE;
+        assert_eq!(store.insert(HELLO), LATIN1_NUM);
+        assert_eq!(store.get_ref(HELLO).unwrap(), HELLO);
+        store.validate_contents().ok();
+    }
+
+    #[test]
+    fn test_reserve_front_loads_allocation() {
+        // after `reserve`, `push` must not grow a Vec or start a chunk:
+        // it runs while the index entry is already published
+        let mut arena: StrArena = StrArena::with_capacity(0, 16);
+        let strs: [&str; 5] = ["abc", "defghijklmno", "pqrs", "an oversized string", "t"];
+        for s in strs {
+            arena.reserve(s.len());
+            let before = (arena.chunks.len(), arena.slots.capacity(), arena.oversized.capacity());
+            arena.push(s);
+            let after = (arena.chunks.len(), arena.slots.capacity(), arena.oversized.capacity());
+            assert_eq!(before, after, "push of {s:?} allocated after reserve");
+        }
+        assert_eq!(arena.iter().collect::<Vec<&str>>(), strs);
+        assert_eq!(arena.oversized.len(), 1);
+    }
+
+    #[test]
+    fn test_chunk_size_is_clamped() {
+        // an unallocatable chunk size used to panic on the first insert
+        let chunk = |size: usize| UniqueStrStore::new_with_capacity(1, size).0.store.read().chunk_size;
+        assert_eq!(chunk(0), 1);
+        assert_eq!(chunk(ARENA_CHUNK_SIZE), ARENA_CHUNK_SIZE);
+        assert_eq!(chunk(usize::MAX), MAX_ARENA_CHUNK_SIZE);
     }
 
     #[test]
@@ -2651,6 +2800,35 @@ mod tests {
             "input <-> reconstruct() mismatch (not split)"
         );
 
+        store.validate_contents().ok();
+    }
+
+    #[rustfmt::skip]
+    #[test]
+    fn test_split_and_store_multi() {
+        /*
+        Delimiter tokens reuse the index their delimiter was interned at,
+        for multi-character, single-character and duplicated delimiters;
+        an empty delimiter maps to 0. The parts concatenate to the input.
+        */
+        let store: UniqueStrStore = UniqueStrStore::new();
+        let input: &str = "key = value :: next=1 :: end";
+        let delims: [&str; 5] = [" :: ", " = ", "", "=", " :: "];
+        let (parts, delim_idx) = store.split_and_store_multi(input, &delims, None);
+
+        let exp: [&str; 9] = ["key", " = ", "value", " :: ", "next", "=", "1", " :: ", "end"];
+        let got: Vec<&str> = parts.iter().map(|&i| store.get(i).unwrap()).collect();
+        assert_eq!(got, exp);
+        assert_eq!(got.concat(), input);
+
+        assert_eq!(delim_idx.len(), delims.len());
+        for (d, &i) in delims.iter().zip(&delim_idx) {
+            assert_eq!(store.get(i).unwrap(), *d);
+        }
+        assert_eq!(delim_idx[2], 0, "an empty delimiter maps to index 0");
+        assert_eq!(delim_idx[0], delim_idx[4], "a duplicated delimiter interns once");
+        assert_eq!([parts[1], parts[3], parts[5], parts[7]],
+                   [delim_idx[1], delim_idx[0], delim_idx[3], delim_idx[0]]);
         store.validate_contents().ok();
     }
 
