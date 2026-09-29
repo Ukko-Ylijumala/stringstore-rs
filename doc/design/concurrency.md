@@ -42,7 +42,7 @@ Up to v0.4.1 every such read took the store `RwLock` in read mode: two atomic re
 
 The same change lifted duplicate inserts from 12.5 to ~50 M/s at 32 threads (64-bit keys, whose content check now reads the slot without a lock), and readers running beside a writer from 5.6 to ~46 M/s at 16 threads, with the writer itself going from 0.4 to 1.3 M inserts/s.
 
-`get` keeps the wait in a `#[cold]`, `#[inline(never)]` function reached by a tail call. A plain call there made the compiler save three registers on *every* read, which cost `get` about a quarter of its throughput at 32 threads; with the tail call the inlined fast path needs no saves.
+`get` and the internal `slot` keep the wait in a `#[cold]`, `#[inline(never)]` function reached by a tail call. A plain call there made the compiler save three registers on *every* read, which cost `get` about a quarter of its throughput at 32 threads; with the tail call the inlined fast path needs no saves. The `StoredStr` trait impls are `#[inline]` so this fast path also inlines into other crates.
 
 ### The one index that may be in flight
 

@@ -741,14 +741,26 @@ impl UniqueStrStore {
     The string at internal index `i`, which must be one the store handed
     out (an index entry) or that a bounds check admitted. Takes no lock,
     and may briefly wait for an in-flight copy (see `await_copy`).
+
+    The wait is a cold tail call, so the inlined fast path (every
+    `StoredStr` read goes through here) needs no register saves.
     */
     #[inline]
     fn slot(&self, i: u32) -> &str {
-        if i + LATIN1_NUM >= self.0.len.load(AtomicOrdering::Acquire) {
-            // published, so the copy is in flight: it ends before the unlock
-            self.await_copy(i);
+        if i + LATIN1_NUM < self.0.len.load(AtomicOrdering::Acquire) {
+            // SAFETY: the Acquire load of `len` shows the slot written
+            return unsafe { &*self.0.slots.read(i) };
         }
-        // SAFETY: written and observed, per the contract above
+        self.slot_in_flight(i)
+    }
+
+    /// `slot` for an index at or past `len` as last seen: published, so
+    /// its copy is in flight and ends before the insert unlocks.
+    #[cold]
+    #[inline(never)]
+    fn slot_in_flight(&self, i: u32) -> &str {
+        self.await_copy(i);
+        // SAFETY: `await_copy` returned, so the slot is written and observed
         unsafe { &*self.0.slots.read(i) }
     }
 
@@ -1439,6 +1451,7 @@ impl<'a> StoredStr<'a> {
         unsafe { &*self.1.get_str_ptr(self.0) }
     }
 
+    #[inline]
     pub fn as_ptr(&self) -> StoredStrPtr {
         StoredStrPtr(unsafe { (*self.1).get_str_ptr(self.0) })
     }
@@ -1462,6 +1475,7 @@ impl<'a> StoredStr<'a> {
 /* --------------------------------- */
 
 impl<'a> AsRef<str> for StoredStr<'a> {
+    #[inline]
     fn as_ref(&self) -> &str {
         self.reference()
     }
@@ -1470,6 +1484,7 @@ impl<'a> AsRef<str> for StoredStr<'a> {
 impl<'a> Deref for StoredStr<'a> {
     type Target = str;
 
+    #[inline]
     fn deref(&self) -> &Self::Target {
         self.reference()
     }
@@ -1480,6 +1495,7 @@ impl<'a> Deref for StoredStr<'a> {
 impl<'a> Eq for StoredStr<'a> {}
 
 impl<'a> PartialEq for StoredStr<'a> {
+    #[inline]
     fn eq(&self, other: &Self) -> bool {
         /*
         Same underlying store: interning guarantees equal content <=>
@@ -1495,18 +1511,21 @@ impl<'a> PartialEq for StoredStr<'a> {
 }
 
 impl<'a> PartialOrd for StoredStr<'a> {
+    #[inline]
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
 impl<'a> Ord for StoredStr<'a> {
+    #[inline]
     fn cmp(&self, other: &Self) -> Ordering {
         self.reference().cmp(other.reference())
     }
 }
 
 impl<'a> Hash for StoredStr<'a> {
+    #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.reference().hash(state)
     }
@@ -1529,12 +1548,14 @@ impl<'a> Display for StoredStr<'a> {
 /* --------------------------------- */
 
 impl<'a> PartialEq<StoredStr<'a>> for &str {
+    #[inline]
     fn eq(&self, other: &StoredStr) -> bool {
         *self == other.reference()
     }
 }
 
 impl<'a> PartialEq<&str> for StoredStr<'a> {
+    #[inline]
     fn eq(&self, other: &&str) -> bool {
         self.reference() == *other
     }
@@ -1544,12 +1565,14 @@ impl<'a> PartialEq<&str> for StoredStr<'a> {
 
 // Implement `From` for converting `StoredStr` into `u32`.
 impl<'a> From<StoredStr<'a>> for u32 {
+    #[inline]
     fn from(v: StoredStr) -> u32 {
         v.0
     }
 }
 
 impl<'a> From<StoredStr<'a>> for &'a str {
+    #[inline]
     fn from(v: StoredStr<'a>) -> &'a str {
         // see `reference` for why the unchecked lookup is sound
         unsafe { &*v.1.get_str_ptr(v.0) }
