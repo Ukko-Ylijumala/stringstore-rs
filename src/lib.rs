@@ -29,6 +29,8 @@ use size_of::{Context, SizeOf};
 const EMPTY_STR: &str = "";
 const PATH_SEP: &str = "/";
 const LATIN1_NUM: u32 = 256;
+/// Maximum number of user-inserted strings; see `insert_unchecked`.
+const MAX_USER_STRINGS: usize = (u32::MAX - LATIN1_NUM) as usize;
 
 /**
 A memory-efficient storage for unique string slices with stable indexing.
@@ -306,10 +308,13 @@ impl UniqueStrStore {
 
         /*
         Refuse inserts that would overflow the u32 public index space.
-        Public index = internal index + LATIN1_NUM, so the maximum number
-        of user-inserted strings is u32::MAX - LATIN1_NUM + 1.
+        Public index = internal index + LATIN1_NUM, and the public length
+        counter `len` is itself a u32, so the store can hold at most
+        MAX_USER_STRINGS user-inserted strings: the last one lands at
+        public index u32::MAX - 1 and pushes `len` to exactly u32::MAX.
+        (Allowing one more would wrap `len` to 0.)
         */
-        if len >= (u32::MAX - LATIN1_NUM + 1) as usize {
+        if len >= MAX_USER_STRINGS {
             return Err(StringStoreError::StoreFull);
         }
 
@@ -626,7 +631,8 @@ impl UniqueStrStore {
         let mut result: String = String::new();
         for (i, idx) in indices.iter().enumerate() {
             if idx >= &stored_num {
-                return Err(StringStoreError::reconstruction(*idx, i, stored_num));
+                // `max` is the highest valid index, like `IndexOutOfBounds`
+                return Err(StringStoreError::reconstruction(*idx, i, stored_num - 1));
             }
 
             if idx != &0 {
@@ -1462,7 +1468,8 @@ pub enum StringStoreError {
     /// Error when the store has reached its maximum capacity (u32::MAX).
     StoreFull,
     /// Error when attempting to reconstruct a string with invalid parts.
-    /// Contains details about which part caused the error.
+    /// Contains the offending index, its position in the input slice,
+    /// and the highest valid index.
     InvalidReconstruction { idx: u32, pos: usize, max: u32 },
     /// Error when string reconstruction would exceed the maximum allowed size.
     ReconstructionTooLarge { requested: usize, max: usize },
@@ -1948,6 +1955,23 @@ mod tests {
         );
 
         store.validate_contents().ok();
+    }
+
+    #[test]
+    fn test_reconstruct_oob_reports_max_index() {
+        // Both error variants report the highest *valid* index as `max`.
+        let store: UniqueStrStore = UniqueStrStore::new();
+        let last: u32 = store.insert("last");
+        let bad: u32 = last + 1;
+
+        assert_eq!(
+            store.reconstruct(&[last], bad),
+            Err(StringStoreError::oob(bad, last as usize))
+        );
+        assert_eq!(
+            store.reconstruct(&[last, bad], last),
+            Err(StringStoreError::reconstruction(bad, 1, last))
+        );
     }
 
     #[rustfmt::skip]
