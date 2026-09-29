@@ -6,10 +6,12 @@ description = "String interning library for Rust"
 repository = "https://github.com/Ukko-Ylijumala/stringstore-rs"
 readme = "README.md"
 license = "MIT OR Apache-2.0"
-categories = ["data-structures", ""]
+categories = ["data-structures"]
 keywords = ["string", "interning"]
 publish = false
 edition = "2021"
+# `u64::is_multiple_of` (Hex::to_string) needs 1.87; `#[expect]` needs 1.81.
+rust-version = "1.87"
 
 [features]
 #default = ["size_of"]

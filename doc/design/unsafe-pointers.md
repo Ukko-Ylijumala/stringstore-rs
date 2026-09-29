@@ -51,7 +51,7 @@ If any of these need to change, the unsafe APIs must be rethought from scratch �
 The documented contract is: **the pointer is valid only as long as the originating `UniqueStrStore` is alive**. Concretely:
 
 - Storing a `StoredStrPtr` in a `'static` collection is sound *only* if the originating store is itself in a `'static` location (e.g. behind a `OnceLock` or `lazy_static`).
-- Sending a `StoredStrPtr` to a thread that may outlive the store is unsound. There is no `Send`/`Sync` bound preventing this — be careful.
+- `StoredStrPtr` wraps a raw pointer, so it is automatically `!Send` and `!Sync`: it cannot be moved to or shared with another thread at all, and the crate deliberately provides no `unsafe impl` to change that. The `&str` you get out of it (`as_str`, `From<StoredStrPtr>`) *is* `Send + Sync`, so the "thread outlives the store" hazard still exists through that conversion — be careful.
 - Cloning the store (`Arc` clone) keeps the pointer valid as long as *any* clone is live, because all clones share the same underlying `Box<str>` allocations.
 
 `StoredStr<'a>` is the safe alternative for almost every use case: it carries a `&'a UniqueStrStore` so the lifetime is checked, at the cost of an extra word per handle.
