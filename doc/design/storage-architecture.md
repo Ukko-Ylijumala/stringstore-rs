@@ -23,7 +23,7 @@ length:                len: AtomicU32  // public length, starts at 256; publishe
 2. **`slots: SlotTable` plus `store: Mutex<StrArena>`** — the actual interned strings. Internally indexed `0..N`, but every public-facing index is offset by `LATIN1_NUM` (256). `SlotTable` holds one fat pointer per string in fixed segments of doubling size (`32 << k` slots in segment `k`, 27 segments covering every index), which never move, so any thread reads a slot without a lock. The pointers lead into the chunked bump arena `StrArena`, which only inserts touch, under the mutex; see "String bytes: the arena" below and `concurrency.md`. A segment is allocated zeroed on first use (or up front for `new_with_capacity`), so its pages stay untouched until slots are written — like `Vec::with_capacity`, but rounded up to whole segments.
 3. **`index: DashMap<HashKey, u32, PreHashed>`** — content-to-position lookup, keyed by the xxh3 hash of the bytes (`HashKey` is `u64` by default, `u128` with the `xxh128` feature; see below). The stored value is the *internal* `store` index (pre-offset). `PreHashed` is an identity `BuildHasher`: the keys are already uniformly distributed 64-bit digests, so the map passes them straight through instead of running them through a second (streaming, 832-byte-state) Xxh3 pass per lookup. That second pass used to cost ~140 ns per map operation versus ~30 ns now; it is the single largest cost that was removed from `contains`/`idx`/`insert`.
 
-`len` is a `std::sync::atomic::AtomicU32` that holds the authoritative public length. It starts at 256 (the ASCII range is always "present"), and is stored by the mutex holder in `insert_unchecked` only after the new string's slot is written. The store uses `Release` ordering and every read loads `len` with `Acquire` before it reads a slot, so observing the new length implies the slot and the string bytes are visible. That pairing is what lets reads skip the lock.
+`len` is a `std::sync::atomic::AtomicU32` that holds the authoritative public length. It starts at 256 (the ASCII range is always "present"), and is stored by the mutex holder in `insert_locked` only after the new string's slot is written. The store uses `Release` ordering and every read loads `len` with `Acquire` before it reads a slot, so observing the new length implies the slot and the string bytes are visible. That pairing is what lets reads skip the lock.
 
 ## String bytes: the arena
 
@@ -56,13 +56,13 @@ The constant `LATIN1_NUM = 256` is load-bearing. Any code touching indices must 
 | Space | Range | Where it appears |
 |---|---|---|
 | Public (offset applied) | `0..len()` | All `pub` method args and returns, `idx()`, `get()`, `borrow_str(idx)`, `StoredStr.0`, etc. |
-| Internal (slots) | `0..len() - 256` | DashMap values, the `idx` variable inside `insert_unchecked`, `SlotTable::read/write`, `slot(i)`. |
+| Internal (slots) | `0..len() - 256` | DashMap values, the `idx` variable inside `insert_locked`, `SlotTable::read/write`, `slot(i)`. |
 
 Translation points to watch:
 
 - `idx()`: returns `self.index.get(...).map(|r| r.value() + LATIN1_NUM)` — DashMap value is internal, add the offset for the public answer.
 - `lookup(idx)` / `get_str_ptr(idx)`: branch on `idx < LATIN1_NUM`. If yes, hit `ascii[idx]` directly. If no, read slot `idx - LATIN1_NUM`. `lookup` is the bounds-checked form (`get`, `borrow_str`, `reconstruct`), checking against `len`; `get_str_ptr` (via `slot`) is the unchecked form for callers that already hold a valid index (`get_ptr`, `StoredStr`). Neither takes a lock.
-- `insert_unchecked`: the looked-up `indexed` and the new `idx = len - LATIN1_NUM` are internal; both return paths add `LATIN1_NUM`.
+- `insert_locked`: the looked-up `indexed` and the new `idx = len - LATIN1_NUM` are internal; both return paths add `LATIN1_NUM`.
 - `reconstruct`: `lookup` for each part; the store only grows, so an index validated in the sizing pass is still valid in the build pass.
 
 ## Why the split exists
@@ -78,7 +78,7 @@ The `index` DashMap is keyed by the xxh3 hash of the string bytes — within the
 
 The policy as of v0.3.9 (64-bit keys, the default):
 
-- **`insert` verifies.** On a hash hit — both in the fast path and in the lost-race branch inside `insert_unchecked` — the stored string's contents are compared against the incoming string. A mismatch calls `collision_panic`: a deliberate panic, because silently returning the other string's index would corrupt every downstream index vector. There is no graceful recovery without re-keying the index (e.g. `DashMap<u64, SmallVec<u32>>`); revisit only if a collision is ever observed in the wild.
+- **`insert` verifies.** On a hash hit — both in the fast path and in the lost-race branch inside `insert_locked` — the stored string's contents are compared against the incoming string. A mismatch calls `collision_panic`: a deliberate panic, because silently returning the other string's index would corrupt every downstream index vector. There is no graceful recovery without re-keying the index (e.g. `DashMap<u64, SmallVec<u32>>`); revisit only if a collision is ever observed in the wild.
 - **`contains` and `idx` do not verify.** They remain pure hash lookups (no content fetch) to keep them as cheap as possible. Consequence: for a string that was *never inserted* but collides with a stored one, `contains` returns a false positive and `idx` returns the colliding string's index. Strings that went through `insert` are unaffected — the insert-time check guarantees no two *stored* strings share a hash.
 
 Cost of the insert-side check: every duplicate `insert` reads the stored string's slot (no lock) and performs one string comparison. The new-string path is unchanged (one hash, one DashMap miss, then the insert under the mutex).
@@ -88,7 +88,7 @@ Cost of the insert-side check: every duplicate `insert` reads the stored string'
 With `--features xxh128`, `HashKey` becomes `u128` (xxh3-128 via `xxhash_rust::xxh3::xxh3_128`, default secret) and `verify_hit` / `collision_panic` are not compiled at all. The collision odds drop to ~n²/2¹²⁹ (about 10⁻²⁵ at 10M strings), and in exchange:
 
 - The duplicate-insert path returns straight from the DashMap: no slot read, no string compare. `insert` of an already-interned string becomes as cheap as `idx`.
-- The lost-race branch inside `insert_unchecked` likewise trusts the hash.
+- The lost-race branch inside `insert_locked` likewise trusts the hash.
 - `contains`/`idx` false positives become equally negligible.
 
 What it costs: the index entry grows from `(u64, u32)` to `(u128, u32)`, which with alignment is 16 → 32 bytes per interned string in the map (plus hashbrown's control byte either way), and xxh3-128 is marginally slower to compute than xxh3-64. That doubling is why the feature is off by default: the 64-bit key plus verification is the memory-efficient "good enough" trade for regular use. `PreHashed` xor-folds the two halves of a 128-bit key into the 64-bit hash the map wants, so every key bit still participates in shard and bucket selection.
@@ -113,4 +113,4 @@ Up to v0.4.1 the feature bought far more under contention: with 64-bit keys ever
 
 Once a string is inserted, its public index is permanent. There is no removal, shrink, or compaction API — by design. This is what makes the unsafe pointer surface sound; see `unsafe-pointers.md`.
 
-The maximum number of *user-inserted* unique strings is `MAX_USER_STRINGS = u32::MAX - LATIN1_NUM`. The last permitted string lands at public index `u32::MAX - 1` and pushes the `u32` length counter to exactly `u32::MAX`; one more would wrap `len` to 0. `insert_unchecked` returns `Err(StoreFull)` if the stored count reaches that ceiling, before mutating any state. `try_insert` surfaces that error to the caller; the public `insert` returns a bare `u32` and so panics on it. (A hash collision panics on *both* paths — it is unrepresentable, not recoverable; see the collision policy above.)
+The maximum number of *user-inserted* unique strings is `MAX_USER_STRINGS = u32::MAX - LATIN1_NUM`. The last permitted string lands at public index `u32::MAX - 1` and pushes the `u32` length counter to exactly `u32::MAX`; one more would wrap `len` to 0. `insert_locked` returns `Err(StoreFull)` if the stored count reaches that ceiling, before mutating any state. `try_insert` / `try_insert_many` surface that error to the caller; `insert` / `insert_many` panic on it. (A hash collision panics on *both* paths — it is unrepresentable, not recoverable; see the collision policy above.)

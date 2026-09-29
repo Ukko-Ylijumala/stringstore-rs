@@ -35,6 +35,7 @@ store.validate_contents().expect("store is consistent");
 
 The crate also provides:
 
+- `insert_many` / `try_insert_many` — intern a batch of strings, taking the writer mutex at most once for the whole batch; much faster than per-string inserts when many threads add new strings at once.
 - `split_and_store` / `split_and_store_multi` — split a string on one or more delimiters and intern each part.
 - `store_path` — normalize a filesystem path and intern each segment.
 - `reconstruct` — rebuild the original string from a slice of indices.
@@ -63,7 +64,7 @@ See [`doc/design/`](doc/design/README.md) for per-feature design notes — stora
 
 - No string removal or modification (this is what makes the index stability and unsafe pointer surface sound — see [`doc/design/unsafe-pointers.md`](doc/design/unsafe-pointers.md)).
 - No partial deduplication; substrings of stored strings are not themselves shared.
-- Maximum user-inserted unique strings: `u32::MAX - 256`. `insert` panics on overflow; `try_insert` returns `StoreFull` instead.
+- Maximum user-inserted unique strings: `u32::MAX - 256`. `insert` / `insert_many` panic on overflow; `try_insert` / `try_insert_many` return `StoreFull` instead.
 - Delimiter matching in `tokenize` / `split_and_store_multi` is leftmost-first with the earliest delimiter in the slice winning, so the order of overlapping delimiters matters. See [`doc/design/tokenization.md`](doc/design/tokenization.md).
 
 ## License

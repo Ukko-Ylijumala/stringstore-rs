@@ -557,6 +557,15 @@ impl Drop for SlotTable {
     }
 }
 
+/// Outcome of the lock-free first half of an insert (`UniqueStrStore::find_or_hash`).
+enum Resolved {
+    /// Needs no insert: the public index of the empty string, of a single
+    /// ISO-8859-1 character, or of an already interned string.
+    Found(u32),
+    /// Not interned (yet): the index key to insert the string under.
+    Missing(HashKey),
+}
+
 // The derived `Default` would bypass `new()` and produce a store with an
 // empty `ascii` table and `len == 0`, violating every invariant.
 impl Default for UniqueStrStore {
@@ -844,6 +853,19 @@ impl UniqueStrStore {
     */
     fn insert_unchecked(&self, s: &str, key: HashKey) -> StringStoreResult<u32> {
         let mut arena = self.0.store.lock();
+        self.insert_locked(&mut arena, s, key)
+    }
+
+    /**
+    The body of `insert_unchecked`, run by a caller that already holds the
+    store mutex (`arena` is its guarded contents) - so that a batch can
+    insert all of its strings under one lock hold. Each call completes a
+    whole insert, `len` store included, before it returns: a later string
+    of the same batch may be a duplicate of this one, and its recheck then
+    reads this slot, which must already be below `len` (a slot at or past
+    `len` must never be read under the mutex).
+    */
+    fn insert_locked(&self, arena: &mut StrArena, s: &str, key: HashKey) -> StringStoreResult<u32> {
         // only the mutex holder moves `len`, so this is stable until we unlock
         let len: usize = (self.0.len.load(AtomicOrdering::Relaxed) - LATIN1_NUM) as usize;
 
@@ -883,7 +905,7 @@ impl UniqueStrStore {
                 on fresh inserts; see `doc/design/concurrency.md`.)
                 */
                 vacant.insert(idx);
-                self.write_slot(&mut arena, idx, s);
+                self.write_slot(arena, idx, s);
                 Ok(idx + LATIN1_NUM)
             }
             Entry::Occupied(hit) => {
@@ -910,13 +932,26 @@ impl UniqueStrStore {
     /// Core insert logic shared by `insert` and `try_insert`. Borrows only —
     /// the already-interned case (the hot path) allocates nothing.
     fn insert_internal(&self, s: &str) -> StringStoreResult<u32> {
+        match self.find_or_hash(s) {
+            Resolved::Found(idx) => Ok(idx),
+            Resolved::Missing(key) => self.insert_unchecked(s, key),
+        }
+    }
+
+    /**
+    The lock-free first half of every insert: resolve `s` if it needs no
+    insert, or else hash it for the locked second half (which rechecks the
+    index, see `insert_locked`), so each string is hashed only once.
+    */
+    #[inline]
+    fn find_or_hash(&self, s: &str) -> Resolved {
         if s.is_empty() {
-            return Ok(0);
+            return Resolved::Found(0);
         }
 
         if s.len() <= 2 {
             if let Some(c) = return_iso8859_1_cp(s) {
-                return Ok(c); // ISO-8859-1 code point
+                return Resolved::Found(c); // ISO-8859-1 code point
             }
         }
 
@@ -934,9 +969,9 @@ impl UniqueStrStore {
             */
             #[cfg(not(feature = "xxh128"))]
             verify_hit(self.slot(internal), internal, s);
-            return Ok(internal + LATIN1_NUM);
+            return Resolved::Found(internal + LATIN1_NUM);
         }
-        self.insert_unchecked(s, key)
+        Resolved::Missing(key)
     }
 
     /**
@@ -975,6 +1010,68 @@ impl UniqueStrStore {
         T: AsRef<str>,
     {
         self.insert_internal(s.as_ref())
+    }
+
+    /**
+    Insert a batch of strings; returns their indices in input order.
+
+    Same result as calling `insert` on each string in turn (duplicates
+    within the batch get one index, the first occurrence inserting it),
+    but the store mutex is taken **at most once** for the whole batch
+    instead of once per new string. Strings that need no insert (already
+    interned, empty, single ISO-8859-1 characters) are resolved lock-free
+    first, as in `insert`; a batch of those only never takes the lock.
+
+    Meant for bulk producers with many new strings, e.g. a parallel
+    directory walker interning file names: with every worker taking the
+    mutex per string, the handoffs dominate once the per-string work is
+    small. The cost is a longer hold: a reader that has to wait out an
+    in-flight index (see `doc/design/concurrency.md`) may wait for the
+    rest of the batch, and so may other writers. Keep batches moderate
+    (tens to a few hundred strings).
+
+    Panics when the store is full, and on a genuine hash collision (64-bit
+    keys), like `insert`. See `try_insert_many` for a non-panicking
+    alternative to the former.
+    */
+    pub fn insert_many<T>(&self, strs: &[T]) -> Vec<u32>
+    where
+        T: AsRef<str>,
+    {
+        match self.try_insert_many(strs) {
+            Ok(indices) => indices,
+            Err(e) => panic!("UniqueStrStore::insert_many failed: {e}"),
+        }
+    }
+
+    /**
+    Like `insert_many`, but returns [StringStoreError::StoreFull] instead of
+    panicking when the u32 index space runs out. The strings of the batch
+    inserted before the one that did not fit stay inserted.
+    */
+    pub fn try_insert_many<T>(&self, strs: &[T]) -> StringStoreResult<Vec<u32>>
+    where
+        T: AsRef<str>,
+    {
+        let mut indices: Vec<u32> = Vec::with_capacity(strs.len());
+        // (position in `strs`, index key) of the strings that need an insert
+        let mut missing: Vec<(usize, HashKey)> = Vec::new();
+        for (pos, s) in strs.iter().enumerate() {
+            match self.find_or_hash(s.as_ref()) {
+                Resolved::Found(idx) => indices.push(idx),
+                Resolved::Missing(key) => {
+                    indices.push(0); // placeholder, filled in below
+                    missing.push((pos, key));
+                }
+            }
+        }
+        if !missing.is_empty() {
+            let mut arena = self.0.store.lock();
+            for (pos, key) in missing {
+                indices[pos] = self.insert_locked(&mut arena, strs[pos].as_ref(), key)?;
+            }
+        }
+        Ok(indices)
     }
 
     /// The [StoredStr] reference of a stored string slice, if it exists.
@@ -2766,18 +2863,35 @@ mod tests {
 
     #[test]
     fn test_reader_follows_writer() {
-        /*
-        Readers chase a writer: each spins on `idx` until the next string
-        appears, then reads it back through every read path. Inserts
-        publish the entry before the copy lands; the reads must wait for
-        it, not fail or read an unwritten slot.
-        */
+        readers_follow_writer(1);
+    }
+
+    #[test]
+    fn test_reader_follows_batch_writer() {
+        // a batch holds the mutex across many inserts; waiting readers must cope
+        readers_follow_writer(50);
+    }
+
+    /**
+    Readers chase a writer: each spins on `idx` until the next string
+    appears, then reads it back through every read path. Inserts publish
+    the entry before the copy lands; the reads must wait for it, not fail
+    or read an unwritten slot. The writer inserts one string at a time
+    (`batch == 1`) or `batch` strings per `insert_many`.
+    */
+    fn readers_follow_writer(batch: usize) {
         // Miri interprets every spin; a few hundred rounds still interleave
         const N: usize = if cfg!(miri) { 300 } else { 20_000 };
         let store: UniqueStrStore = UniqueStrStore::new();
         let writer = {
             let store = store.clone();
-            thread::spawn(move || (0..N).for_each(|i| _ = store.insert(format!("follow-{i}"))))
+            thread::spawn(move || {
+                let all: Vec<String> = (0..N).map(|i| format!("follow-{i}")).collect();
+                match batch {
+                    1 => all.iter().for_each(|s| _ = store.insert(s)),
+                    _ => all.chunks(batch).for_each(|c| _ = store.insert_many(c)),
+                }
+            })
         };
         let readers: Vec<_> = (0..3)
             .map(|_| {
@@ -3202,6 +3316,93 @@ mod tests {
         assert_eq!(store.try_insert(HELLO), Ok(idx), "duplicate should return same index");
         assert_eq!(store.insert(HELLO), idx, "insert/try_insert must agree");
         assert_eq!(store.len(), LATIN1_NUM as usize + 1);
+    }
+
+    #[test]
+    fn test_insert_many_matches_insert() {
+        let batched: UniqueStrStore = UniqueStrStore::new();
+        let single: UniqueStrStore = UniqueStrStore::new();
+        // one string interned before the batch, taking the lock-free hit path
+        assert_eq!(batched.insert("pre"), single.insert("pre"));
+
+        // new, empty, 1- and 2-byte ISO-8859-1, pre-interned, in-batch duplicates
+        let input: [&str; 9] = ["alpha", "", "a", "é", "pre", "beta", "alpha", "€", "beta"];
+        let indices: Vec<u32> = batched.insert_many(&input);
+        let expected: Vec<u32> = input.iter().map(|s: &&str| single.insert(s)).collect();
+        assert_eq!(indices, expected, "insert_many must agree with sequential inserts");
+        assert_eq!(indices[0], indices[6], "in-batch duplicates share one index");
+        assert_eq!(indices[5], indices[8], "in-batch duplicates share one index");
+        assert_eq!(indices[1], 0, "the empty string is index 0");
+        assert_eq!(indices[3], 'é' as u32, "a 2-byte ISO-8859-1 char is its codepoint");
+        for (idx, s) in indices.iter().zip(input) {
+            assert_eq!(batched.get(*idx).unwrap(), s);
+        }
+        assert_eq!(batched.len(), single.len());
+        batched.validate_contents().ok();
+
+        // all known: resolved without an insert, the store does not grow
+        let len: usize = batched.len();
+        assert_eq!(batched.insert_many(&input), indices);
+        assert_eq!(batched.len(), len);
+        // owned strings work too, and so does an empty batch
+        let owned: Vec<String> = vec!["gamma".to_string(), "alpha".to_string()];
+        assert_eq!(batched.insert_many(&owned), vec![batched.insert("gamma"), indices[0]]);
+        assert!(batched.insert_many::<&str>(&[]).is_empty());
+    }
+
+    #[test]
+    fn test_try_insert_many() {
+        let store: UniqueStrStore = UniqueStrStore::new();
+        let indices: Vec<u32> = store.try_insert_many(&[HELLO, "", HELLO]).unwrap();
+        assert_eq!(indices, vec![LATIN1_NUM, 0, LATIN1_NUM]);
+        assert_eq!(store.try_insert(HELLO), Ok(LATIN1_NUM), "try_insert/try_insert_many must agree");
+        assert_eq!(store.len(), LATIN1_NUM as usize + 1);
+    }
+
+    #[test]
+    fn test_competing_insert_many() {
+        /*
+        All threads intern the same strings, in batches that start at
+        different offsets so the batches overlap only partly; every other
+        thread uses plain inserts. Batched and single inserts must agree on
+        every index, and each string must be stored exactly once.
+        */
+        const BATCH: usize = 64;
+        // Miri: a few batches per thread still overlap and compete
+        let per_thread: usize = if cfg!(miri) { 4 * BATCH } else { CONC_S_NUM / CONC_T_NUM };
+        let exp_len: usize = per_thread + LATIN1_NUM as usize;
+        let store: UniqueStrStore = UniqueStrStore::new();
+        let all: Arc<Vec<String>> =
+            Arc::new((0..per_thread).map(|i| format!("{HELLO} i: {i}")).collect());
+
+        let threads: Vec<_> = (0..CONC_T_NUM)
+            .map(|t: usize| {
+                let store = store.clone();
+                let all = all.clone();
+                thread::spawn(move || {
+                    let mut indices: Vec<u32> = Vec::with_capacity(all.len());
+                    if t % 2 == 1 {
+                        all.iter().for_each(|s| indices.push(store.insert(s)));
+                        return indices;
+                    }
+                    // an odd head batch shifts this thread's batch boundaries
+                    let (head, rest) = all.split_at((t * 7) % BATCH);
+                    indices.extend(store.insert_many(head));
+                    rest.chunks(BATCH).for_each(|c| indices.extend(store.insert_many(c)));
+                    indices
+                })
+            })
+            .collect();
+
+        let results: Vec<Vec<u32>> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+        for r in &results[1..] {
+            assert_eq!(r, &results[0], "threads disagree on indices");
+        }
+        for (idx, s) in results[0].iter().zip(all.iter()) {
+            assert_eq!(store.get(*idx).unwrap(), s);
+        }
+        store.validate_contents().ok(); // will panic on failure in debug mode
+        assert_eq!(store.len(), exp_len, "Stored num should be {}", exp_len);
     }
 
     #[test]

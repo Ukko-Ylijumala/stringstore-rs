@@ -84,9 +84,30 @@ A reader never reads an unwritten slot and never gets `IndexOutOfBounds` for an 
                                                            return i + LATIN1_NUM
 ```
 
-The hash is computed once (in `insert_internal`, shared by `insert` and `try_insert`) and passed into `insert_unchecked`. `try_insert` is the identical flow with one difference: a full store surfaces as `Err(StoreFull)` instead of a panic.
+The hash is computed once (in `find_or_hash`, the lock-free first half shared by `insert`, `try_insert` and the batched inserts below) and passed into `insert_unchecked`, which takes the mutex and runs steps 2-4 as `insert_locked`. `try_insert` is the identical flow with one difference: a full store surfaces as `Err(StoreFull)` instead of a panic.
 
 The whole path borrows: `insert<T: AsRef<str>>` never copies the input string until `arena.push(s)` memcpys it into the arena — and only on the thread that actually inserts. That copy allocates nothing; a fresh chunk (128 KiB by default) or slot segment is allocated in step 3 only when the current one is full, and a string longer than a chunk gets a dedicated allocation inside `push`. The already-interned case (the hot path) allocates nothing.
+
+### Batched inserts: `insert_many` / `try_insert_many`
+
+A batch runs the same two halves, just regrouped: `find_or_hash` resolves every string of the batch lock-free first (hits, the empty string and single ISO-8859-1 characters never reach the lock), then the remaining strings are inserted one after another by `insert_locked` under **one** mutex hold. A batch of hits only never takes the lock.
+
+- **Each `insert_locked` completes before the next starts** — entry, copy, slot write and `len` store. A later string of the batch may duplicate an earlier one (both missed in the first half); its recheck finds the entry occupied and compares against that slot, which is then already below `len`. That keeps the "no slot at or past `len` under the mutex" rule intact without any special casing. Do not "optimize" a batch into publishing several entries before copying.
+- **Lock ordering is unchanged**: mutex → shard, one shard at a time, no guard held across strings.
+- **Failure**: the only error is `StoreFull`. Strings before the one that did not fit stay inserted (each was a complete insert); nothing of the failing string is published.
+- **The cost is the hold time.** A reader that has to wait out an in-flight index (it learned the index from `idx` a moment before the copy) spins on `len` first, which normally suffices — the copy is one memcpy away. Only a reader that exhausts its spins and falls back to taking the mutex waits for the rest of the batch; so do other writers. Batches of tens to a few hundred strings keep that bounded.
+
+The mutex handoff between writers is what the batch saves, and that cost grows with the number of writers. Measured on one machine (release, 2M distinct strings split over the threads, aggregate throughput; batches of 64):
+
+| threads | `insert` | `insert_many` |
+|---|---|---|
+| 1 | 6.8 M/s | 7.2 M/s |
+| 4 | 5.5 M/s | 5.8 M/s |
+| 8 | 3.1 M/s | 6.9 M/s |
+| 16 | 1.2 M/s | 6.4 M/s |
+| 32 | 0.9 M/s | 5.6 M/s |
+
+In a parallel directory walker (statter) interning file names per 64-entry batch, the same change cut a 200k-file scan at 16 workers from 0.15 s to 0.04 s.
 
 ### Why the recheck after taking the mutex
 
@@ -112,7 +133,7 @@ The trade-off: a benchmark in which readers busy-poll `idx` for strings a writer
 
 ### The lock-ordering rule
 
-The order is **store mutex → index shard**: `insert_unchecked` holds the mutex while it takes a shard lock in `entry()`.
+The order is **store mutex → index shard**: `insert_locked` runs with the mutex held and takes a shard lock in `entry()`.
 
 The fast path copies the `u32` out of the DashMap guard (`self.index.get(&key).map(|r| *r.value())`) **before** reading the slot. Reading a slot can wait on the mutex (an in-flight copy); holding a shard guard during that wait inverts the order — the mutex may by then belong to the *next* insert, which could be waiting for exactly that shard — and deadlocks. Keep it that way everywhere a slot is read.
 
@@ -149,7 +170,8 @@ In **debug builds** the function panics with the error list on any inconsistency
 
 - **Do not** read a slot at or past `len` while holding the store mutex. The mutex is not reentrant, and the wait for an in-flight copy takes it: the holder would deadlock on itself. Code that runs under the mutex (the occupied branch of `insert_unchecked`, `Debug`, `validate_contents`) only reads indices below `len`; there is also no external way to take the mutex.
 - **Do not** hold a DashMap shard guard while reading a slot; see "The lock-ordering rule".
-- **Do not** reorder the steps in `insert_unchecked` so that the copy runs before the DashMap `entry` resolves. The `idx == len` invariant relies on the slot being written exactly when (and only when) the entry is fresh.
+- **Do not** reorder the steps in `insert_locked` so that the copy runs before the DashMap `entry` resolves. The `idx == len` invariant relies on the slot being written exactly when (and only when) the entry is fresh.
+- **Do not** start the next string of a batch before the previous one's `len` store; see "Batched inserts".
 - **Do not** add anything that can panic or otherwise unwind between `v.insert(idx)` and the `len` store. Fallible work (allocation, `Vec` growth) belongs in step 3, before the entry is published.
 - **Do not** store `len` before the slot is written, or write a slot that `len` has already passed. `len` is the only thing that makes a slot visible to lock-free readers.
 - **Do not** add a path that stores `len` without writing a slot, or writes a slot without storing `len`. The `validate_contents` check that the stored count equals `index.len()` catches this, but only after the fact.
