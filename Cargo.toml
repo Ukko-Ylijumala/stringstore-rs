@@ -46,6 +46,7 @@ git = "https://github.com/Ukko-Ylijumala/timesince-rs"
 
 [dependencies.miniutils]
 git = "https://github.com/Ukko-Ylijumala/miniutils-rs"
+default-features = false
 
 # Redirect any transitive crates.io `size-of` reference (e.g. from
 # `custom_xxh3` with its `size_of` feature) to the fork that compiles on
