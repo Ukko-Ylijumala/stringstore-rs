@@ -92,8 +92,10 @@ in scenarios where many duplicate strings are used.
 ## Design Considerations
 - Uses a lock-free segmented table of fat pointers into arena chunks for
   string storage, which is efficient for random access from any thread.
-- Uses a [DashMap] with `u64` Xxh3 string hashes as keys for fast lookups.
-- Custom [xxhash_rust] hasher ([CustomXxh3Hasher]) for potentially faster hashing.
+- Uses a [DashMap] with Xxh3 string hashes as keys for fast lookups: `u64`
+  from `custom_xxh3::hash_bytes` (one-shot, custom secret) by default,
+  `u128` with the `xxh128` feature. The map uses the keys as they are,
+  without hashing them again.
 - Thread-safe.
 - trait [SizeOf]: provides a way to measure the size of the structure in memory.
 - ISO-8859-1: separate non-locking [Vec] for indices 0-255 to avoid locking
@@ -203,8 +205,10 @@ struct StoreInner {
 /**
 [BuildHasher] for the index map, whose keys are already xxh3 digests of
 the string bytes ([HashKey]). Re-hashing them through a full Xxh3 state
-(832 bytes, rebuilt on every lookup) cost ~140 ns per map operation;
-passing the key straight through costs ~30 ns.
+(`CustomXxh3Hasher`, 832 bytes, rebuilt on every lookup) cost ~140 ns
+per map operation; passing the key straight through costs ~30 ns.
+`custom_xxh3::QuickXxh3Builder` would re-hash a `u64` in ~1 ns, but that
+is still 1 ns more than passing it through, for no better distribution.
 
 This is sound because xxh3 output is uniformly distributed across all of
 its bits, which is what [DashMap]'s shard selection (high bits) and

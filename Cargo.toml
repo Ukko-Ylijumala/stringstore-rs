@@ -10,8 +10,9 @@ categories = ["data-structures"]
 keywords = ["string", "interning"]
 publish = false
 edition = "2021"
-# `u64::is_multiple_of` (Hex::to_string) needs 1.87; `#[expect]` needs 1.81.
-rust-version = "1.87"
+# `custom_xxh3` (>= 0.4.1) needs 1.93; this crate alone: `u64::is_multiple_of`
+# (Hex::to_string) needs 1.87, `#[expect]` 1.81.
+rust-version = "1.93"
 
 [features]
 #default = ["size_of"]
