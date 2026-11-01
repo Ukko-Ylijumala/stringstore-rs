@@ -1,6 +1,6 @@
 # Structured text
 
-**Status: data model done, no parser.** `src/structured.rs` (behind the `structured` feature, on by default) carries the data model (`TextElement`, `BigElement`, `StructuredLine`, `CompactStr`, `Character`, `Hex`, `HexFormat`) reworked from a 2024 sketch to the decisions below — step 1 of the implementation order. It compiles under scoped `#[expect(dead_code)]` and has tests only for its layout and `Display`/`Debug` output; nothing produces a `StructuredLine` from text yet. The shapes are still unstable: the open questions at the end may move variants around.
+**Status: parser with the unambiguous recognizers; heuristic recognizers pending.** `src/structured.rs` (behind the `structured` feature, on by default) holds the data model (`TextElement`, `BigElement`, `StructuredLine`, `CompactStr`, `Character`, `Hex`, `HexFormat`), the `Recognizer`s and the `Parser` — steps 1–4 and 6 of the implementation order. Step 5 (hostnames, emails, URLs, sentences, timestamps) is not done: those variants render but nothing produces them from text. The shapes are still unstable (`#[non_exhaustive]`); the open questions at the end may move variants around.
 
 ## Goal
 
@@ -15,9 +15,9 @@ The feature is therefore two cooperating halves: the data model (compact element
 
 ### 1. Round trip is lossless
 
-`Display` of a parsed line must reproduce the input bytes exactly. The sketch renders a *canonical* form (`KeyVal` always prints `=`, `Hex` drops leading zeros, `Day` has one spelling), which is not good enough for log storage, where the original line is the thing people want back.
+`Display` of a parsed line must reproduce the input bytes exactly. The 2024 sketch rendered a *canonical* form (`KeyVal` always prints `=`, `Hex` drops leading zeros, `Day` has one spelling), which is not good enough for log storage, where the original line is the thing people want back.
 
-The mechanism is **verify by re-rendering**, not recording spellings: after a recognizer fires on a slice, render the value back and compare with the slice. On mismatch, the slice is kept as an interned `Word`. This handles `+42`, `007`, `1e5`, `0x00ff`, odd date spellings and anything else for free, costs one small formatting pass per recognized token, and makes every recognizer safe to add — a wrong guess degrades to a word instead of corrupting output. Recognizers may still make *some* spellings exact (hex keeps its width, see below); the rule is what guarantees the rest.
+The mechanism is **verify by re-rendering**, not recording spellings: after a recognizer claims a piece, the parser renders the value back into a scratch buffer and compares it with the piece. On mismatch the next recognizer gets a go, and if none fits the piece is interned as a `Word` (or as `RawText` when it is the body of an enclosure). This handles `+42`, `007`, `1e5`, `2.50`, `0X1F`, `fe80:0:0:0:0:0:0:1` and anything else for free, costs one small formatting pass per recognized piece, and makes every recognizer safe to add — a wrong guess degrades to a word instead of corrupting output. Recognizers still make the common spellings exact (hex keeps its width, see below); the rule is what guarantees the rest. Note the corollary: a value's `Display` *is* the set of spellings it can represent, so `100.0` and `2.50` stay words because `f64` prints them as `100` and `2.5`.
 
 ### 2. An element is 16 bytes
 
@@ -66,35 +66,39 @@ The sketch's `StructuredLine` holds an `Arc<UniqueStrStore>`. `UniqueStrStore` i
 
 `HexFormat` is a `u8` bitmap using three bits (`UPPER`, `PREFIX`, `COLUMNS`). The spare five bits hold the digit width (`with_width`, 0 = natural, clamped to 31), which zero-pads the digits so `0x00ff` renders back as written, making most hex round-trip exactly without going through the fallback. Values longer than 16 digits do not fit `Hex(u64)`; see decision 2. The current `COLUMNS` grouping (by four digits from the right) matches neither MAC addresses (by two) nor anything common in logs; revisit or drop it when the recognizer is written.
 
-### 8. Timestamps are opt-in
+### 8. Timestamps come from a date and a time, not from an integer
 
-Any ten-digit integer is a plausible Unix timestamp; nothing in the token says so. `Timestamp` recognition must be enabled explicitly in the parser config, optionally restricted to a context (a field position, an enclosing bracket, a key name). `Day` and `Time` have unambiguous shapes and are always on. A combined `DateTime` recognizer (`2026-11-01T07:05:00Z`, syslog `Nov  1 07:05:00`) producing a `Timestamp` is the natural way to make the variant useful; it belongs in the heuristic phase (step 6 below).
+`SecondsSinceEpoch` (from `timesince`) displays as `YYYY-MM-DD HH:MM:SS`, so under the re-render rule a `Timestamp` can never come from a bare integer: `1730000000` renders as a date and would not match. That settles decision 8 the easy way — no opt-in integer heuristic. The way to produce a `Timestamp` is a post-pass that merges `Day`, a single-space `Delimiter` and `Time` into one element (UTC assumed), which is both compact (16 bytes for what was 48) and exact. It is heuristic only in the time-zone assumption, so it belongs to step 5 and is off unless asked for. `Day` and `Time` have unambiguous shapes and are in the default set; ISO `T` / `Z` spellings are not recognized and stay words.
 
 ## Pipeline
 
 ```text
-&str line ──► scanner ──► slices ──► recognizers ──► Recognized<'a> ──► intern ──► StructuredLine
-            (pure,          (pure, borrow the         (one insert_many
-             no store)       input, no store)          per line)
+&str line ──► scan ──► Scanned ──► Recognizer::apply ──► Recognized ──► Pending ──► insert_many ──► StructuredLine
+            (pure,                 (pure, borrows the      (re-render       (one writer-mutex
+             no store)              piece, no store)        check)           hold per line)
 ```
 
-- **Scanner.** `scan` with a `ScanRules`: literal delimiters, run characters (a maximal run of one ASCII byte is one piece, which the parser turns into `Character(_, n)` — a `Delimiter` for whitespace, a `Char` otherwise) and enclosure pairs that suppress splitting between `Open` and `Close`. See `tokenization.md`. The entry points `tokenize` / `split_and_store_multi` are unchanged by this.
-- **Recognizers.** Pure functions `fn(&str) -> Option<Recognized>` where `Recognized<'a>` is a small enum over borrowed slices and native values (no interning yet). They run in a configured order on each non-delimiter slice, first match wins, then the re-render check of decision 1. Being store-free, they are tested on bare strings.
-- **Interning.** One pass maps `Recognized<'a>` to `TextElement` by interning every slice it still holds. Collect the slices and use `insert_many` so the writer mutex is taken once per line (see `concurrency.md`).
-- **Config.** A `Parser` built with a builder: delimiters, whitespace class, enclosure pairs, the recognizer set and its order, timestamp policy. `parser.parse(&store, line) -> StructuredLine`.
+- **Scanner.** `scan` with a `ScanRules`: literal delimiters, run characters (a maximal run of one ASCII byte is one piece, which the parser turns into `Character(_, n)` — a `Delimiter` for whitespace, a `Char` otherwise, split above 255 repeats) and enclosure pairs that suppress splitting between `Open` and `Close`. See `tokenization.md`. The entry points `tokenize` / `split_and_store_multi` are unchanged by this.
+- **Recognizers.** `Recognizer::apply(&str) -> Option<Recognized>`, pure and store-free, so they are tested on bare strings. `Recognized` is either a `Scalar(TextElement)` — a finished value with no string parts, which then has to pass the re-render check — or a shape whose strings still need interning (`KeyVal(&str, &str)`); the latter are exact by construction. The parser runs them in order on each text piece, enclosure bodies included, and takes the first that claims it *and* renders back.
+- **Interning.** Every text piece that is still a string (`Word`, `RawText`, delimiters, brackets, both halves of a `KeyVal`) is collected as a `Pending` and interned with one `insert_many` per line, so the writer mutex is taken once per line at most and single characters resolve to the Latin-1 table without touching it. Then the `TextElement`s are built, consuming the indices in order.
+- **Config.** `Parser::new(rules).recognizers(&[..])`; `Parser::default()` is whitespace runs with quotes, brackets and parentheses as enclosures and `Recognizer::DEFAULT`. `parser.parse(&store, line) -> StructuredLine`.
 
 ### Recognizer order and the ambiguities it resolves
 
-| Input | Wanted | Loses to | Rule |
-|---|---|---|---|
-| `10.0.0.1` | `IPv4` | `Float` | IP before float |
-| `2026-11-01` | `Day` | `Range` | date before range |
-| `07:05:00` | `Time` | hex with `COLUMNS` | time before hex |
-| `deadbeef` | `Word` | `Hex` | hex requires `0x` unless configured otherwise |
-| `1730000000` | `Integer` | `Timestamp` | timestamp opt-in (decision 8) |
-| `foo=bar` | `KeyVal` | `Word` | key-value before word, but after URL params |
+`Recognizer::DEFAULT` is `[Ip, Day, Time, Integer, Float, Hex, KeyVal]`. Keep this table in step with it.
 
-The exact list grows with the recognizers; keep it in this table.
+| Input | Wanted | Would otherwise be | Rule |
+|---|---|---|---|
+| `10.0.0.1` | `IPv4` | `Float` (fails to parse anyway) | IP first |
+| `2026-11-01` | `Day` | a `Range`, once ranges are recognized | date before anything with dashes |
+| `07:05:00` | `Time` | hex with `COLUMNS`, if ever recognized | time before anything with colons |
+| `42` | `Integer` | `Float(42.0)`, which also renders as `42` | integer before float |
+| `0x1f` | `HexStr` | — | hex requires the `0x` prefix; `deadbeef` is a word |
+| `1730000000` | `Integer` | `Timestamp` | never (decision 8) |
+| `k=v` | `KeyVal` | `Word` | key-value last, and only without whitespace in the piece |
+| `len=0xff, t=1` | `RawText` | `KeyVal` | a piece with whitespace (an enclosure body) is not a key-value pair |
+
+Known lossy spellings that stay `Word`, by design: `007`, `+5`, `2.50`, `100.0`, `1e5`, `.5`, `inf`/`NaN` (rejected before parsing, so a word in a log is never a float), `0X1F`, `0xdEaD` (mixed case), hex over 16 digits, `fe80:0:0:0:0:0:0:1` (Rust compresses it), `010.0.0.1` (Rust rejects it), `2026-13-01`, `24:00:00`, `7:05:00`.
 
 ## Implementation order
 
@@ -102,9 +106,9 @@ Each step is independently testable and leaves the crate building with no new de
 
 1. **Data model** (decisions 2–7) — *done.* Slimmed the enum, added `BigElement`, flattened enclosures, dropped the generic and the `Arc`, interned raw text, split IPv4 from IPv6, pinned the size with a `const` assertion, gave `HexFormat` its width. No unsafe, no concurrency.
 2. **Scanner extensions** — *done.* `ScanRules` with run characters (a run is one `Run` piece, its length the count) and enclosure pairs (nesting for distinct pairs, unterminated runs to the end), `tokenize_with`, `TokenKind`; checked against a char-by-char `reference_scan` oracle. See `tokenization.md`.
-3. **Unambiguous recognizers**: integer, float, prefixed hex, IPv4/IPv6 via `std::net` parsing, `YYYY-MM-DD`, `HH:MM:SS`, `key=value`. Plus the re-render check.
-4. **`Parser` and `parse`**: wire the three stages, with a property test that random log-like lines round-trip through `Display` byte for byte.
-5. **Heuristic recognizers**: hostname, email, URL, sentence, date-time to `Timestamp`. Each needs a dictionary, a config or context; each lands without touching steps 1–4.
+3. **Unambiguous recognizers** — *done.* Integer, float, prefixed hex, IPv4/IPv6 via `std::net` parsing, `YYYY-MM-DD`, `HH:MM:SS`, `key=value`, plus the re-render check.
+4. **`Parser` and `parse`** — *done.* The three stages wired, with `test_parse_round_trips` parsing 3000 generated log-like lines and checking they come back byte for byte.
+5. **Heuristic recognizers**: hostname, email, URL, sentence, and the `Day` + `Time` merge into `Timestamp`. Each needs a dictionary, a config or context, so none is in `Recognizer::DEFAULT`; each lands without touching steps 1–4.
 6. **Housekeeping** — *done early, so the parser lands in its final home.* The `structured` cargo feature (default on) gates `src/structured.rs` and makes `timesince` optional (it serves only `Timestamp`); the scanner moved to `src/scan.rs`. `lib.rs` keeps the store.
 
 ## Open questions

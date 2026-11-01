@@ -30,7 +30,7 @@ Three source files. `src/lib.rs` holds the store and everything around it; `src/
 | `StringStoreError`, `StringStoreResult` | Error types |
 | `mod tests` | Inline test module |
 | `src/scan.rs`: `ScanRules`, `Scanned`, `ByteClass`, `ScanTable`, `scan`, `scan_tokens`, `tokenize`, `tokenize_with`, `tokenize_regex`, `Token`, `TokenKind` | The byte-class scanner (literal delimiters, run characters, enclosures) and its entry points, used by `split_and_store_multi` (`tokenize_regex` is an alias of `tokenize`) |
-| `src/structured.rs`: `CompactStr`, `Character`, `TextElement`, `BigElement`, `StructuredLine`, `Hex`, `HexFormat` | **Dormant scaffolding** for a structured-text feature; only `HexFormat` is exported, only the formatting is tested. The data model follows `doc/design/structured-text.md` (step 1 done); the parser does not exist yet |
+| `src/structured.rs`: `CompactStr`, `Character`, `TextElement`, `BigElement`, `StructuredLine`, `Hex`, `HexFormat`, `Recognizer`, `Parser` | The structured-text model and parser (all exported from the crate root): a line becomes a `StructuredLine` of 16-byte `TextElement`s, words interned, numbers / IPs / dates / times / hex as values, lossless. See `doc/design/structured-text.md` |
 
 ## Design documentation
 
@@ -41,7 +41,7 @@ The design of the non-obvious bits lives in [`doc/design/`](doc/design/README.md
 - **[Unsafe pointer surface](doc/design/unsafe-pointers.md)** — `borrow_str`, `StoredStrPtr`, and the append-only invariant that keeps them sound. Required reading before adding any removal/mutation API.
 - **[Tokenization](doc/design/tokenization.md)** — the byte-class scanner, its three splitting rules (literal delimiters, run characters, enclosures) and their precedence, why byte-wise stepping is UTF-8 safe, the empty-delimiter footgun, and where further rules plug in.
 - **[Splitting and paths](doc/design/splitting-and-paths.md)** — sentinel-zero encoding shared by `split_and_store`, `store_path`, and `reconstruct`.
-- **[Structured text](doc/design/structured-text.md)** — *design only, nothing implemented.* The target data model (16-byte `TextElement` with a `Big(Box<Big>)` overflow variant, no `Arc` in lines, no generic integer), the lossless-by-re-rendering rule, the scan → recognize → intern pipeline, and the step order. Required reading before touching the dormant scaffolding below.
+- **[Structured text](doc/design/structured-text.md)** — the data model (16-byte `TextElement` with a `Big(Box<BigElement>)` overflow variant, no `Arc` in lines), the lossless-by-re-rendering rule, the scan → recognize → intern pipeline, the recognizer order and what is still open. Required reading before touching `src/structured.rs`.
 
 ## Dependencies
 
@@ -60,6 +60,11 @@ The `structured` feature (on by default) compiles `src/structured.rs`, the struc
 
 The `size_of` feature is currently *off* by default (the `default = ["size_of"]` line in `Cargo.toml` is commented out). The `SizeOf for UniqueStrStore` impl is hand-rolled because `size_of` does not natively support `Mutex` or `DashMap`.
 
-## Dormant scaffolding — do not assume final
+## Structured text — unstable surface
 
-`TextElement`, `BigElement`, `StructuredLine`, `Character`, `CompactStr`, `Hex`, and `HexFormat` (all in `src/structured.rs`) compile but are not wired up to any public API (only their formatting has tests). They are the data model of a structured-text parsing feature whose parser is not written yet, kept compiling via scoped `#[expect(dead_code)]` attributes on the impl blocks and `TextElement` — not a crate-wide allow. When you wire one of these up, its `expect` attribute will warn as an unfulfilled lint expectation; remove it then. Items the tests already exercise (`StructuredLine`, `BigElement`, their impl blocks, the `WithStore` formatting wrapper and the `with_store` helpers) use `#[cfg_attr(not(test), expect(dead_code))]` instead, so the expectation holds under both `cargo build` and `cargo test`. The type definitions themselves carry no attribute (rustc keeps them transitively live via the annotated items). `TextElement` is 16 bytes, enforced by a `const` assertion against `TEXT_ELEMENT_SIZE`; a payload that does not fit goes into `BigElement` behind the `Big` variant, which the constructors (`ip`, `range`, `sentence`, `url`, `url_params`) and accessors (`as_ip`) on `TextElement` hide. `Display` through `with_store` is a canonical rendering; the planned parser makes it byte-exact by keeping any slice that does not re-render identically as a `Word`. Treat the shapes as unstable still — `doc/design/structured-text.md` is the reference, and it lists what remains open.
+`src/structured.rs` (feature `structured`, default on) is the newest part of the crate and its shapes are not settled: `TextElement`, `BigElement` and `Recognizer` are `#[non_exhaustive]`, and `doc/design/structured-text.md` lists what is still open. The invariants that matter:
+
+- `TextElement` is 16 bytes, enforced by a `const` assertion against `TEXT_ELEMENT_SIZE`. A payload that does not fit goes into `BigElement` behind the `Big` variant, which the constructors (`ip`, `range`, `sentence`, `url`, `url_params`) and accessors (`as_ip`, `as_range`, `as_big`) hide; `Debug` through `with_store` never prints `Big(..)`.
+- Nothing in the model holds a store reference; formatting goes through `with_store`, like `StoredStr`.
+- `Parser::parse` is lossless: a recognized value is kept only if it renders back to the exact piece it came from (`007`, `+5`, `2.50`, `1e5` stay words), so `line.with_store(&store).to_string()` is the input byte for byte. `test_parse_round_trips` checks this on generated lines; keep it passing when adding a recognizer, and keep the recognizer-order table in the design doc in step with `Recognizer::DEFAULT`.
+- The variants `Hostname`, `Username`, `Email`, `Timestamp`, `Range`, `Sentence`, `URLStr` and `URLParams` have constructors and rendering but no recognizer yet (step 5 of the design doc); nothing produces them from text.

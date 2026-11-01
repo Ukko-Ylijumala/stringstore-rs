@@ -2,7 +2,7 @@
 
 A memory-efficient, thread-safe string interning library for Rust with stable `u32` indices.
 
-> **Status: heavily WIP.** This crate is pre-1.0 (currently `0.3.x`) and *not* published to crates.io. APIs, internal layout, error variants, and tokenizer behavior may all change without notice. The dormant `TextElement` / `StructuredLine` scaffolding in `src/structured.rs` is an explicit work-in-progress and is not part of the supported surface; its target design is in [`doc/design/structured-text.md`](doc/design/structured-text.md). If you depend on this crate, pin to an exact git rev.
+> **Status: heavily WIP.** This crate is pre-1.0 (currently `0.3.x`) and *not* published to crates.io. APIs, internal layout, error variants, and tokenizer behavior may all change without notice. The structured-text parser (`Parser`, `StructuredLine`, `TextElement` in `src/structured.rs`) is the newest and least settled part; its design and open questions are in [`doc/design/structured-text.md`](doc/design/structured-text.md). If you depend on this crate, pin to an exact git rev.
 
 ## What it does
 
@@ -40,6 +40,8 @@ The crate also provides:
 - `store_path` — normalize a filesystem path and intern each segment.
 - `reconstruct` — rebuild the original string from a slice of indices.
 - `StoredStr<'a>` — a safe handle that derefs to `&str`.
+- `Parser` — parses a line of log-like text into a `StructuredLine` of 16-byte `TextElement`s: words interned, numbers, IP addresses, dates, times and hex as native values, delimiters and enclosures kept. Lossless: `line.with_store(&store).to_string()` is the input. Feature `structured`, on by default.
+- `tokenize_with` / `ScanRules` — the scanner behind it: literal delimiters, run characters and enclosure pairs.
 - `StoredStrPtr` — a raw-pointer handle for callers who can guarantee the store outlives the pointer.
 
 ## Installation
@@ -53,7 +55,7 @@ The crate pulls in a few git-pinned dependencies under the same author (`custom_
 
 ## Features
 
-- `structured` *(on by default)* — the structured-text data model in `src/structured.rs` (and, later, its parser); pulls in the `timesince` dependency. Disable with `default-features = false` for a plain string store.
+- `structured` *(on by default)* — the structured-text parser and model in `src/structured.rs`; pulls in the `timesince` dependency. Disable with `default-features = false` for a plain string store.
 - `size_of` *(off by default)* — implements `size_of::SizeOf` for `UniqueStrStore`, allowing memory footprint accounting. Requires the forked `size-of` git dependency.
 - `xxh128` *(off by default)* — 128-bit xxh3 index keys instead of 64-bit. Makes hash collisions negligible, so duplicate inserts skip the content check (a read of the stored string), at the cost of doubling the per-entry size of the index map. The default 64-bit key with verification is the memory-efficient choice for regular use.
 

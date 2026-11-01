@@ -35,7 +35,10 @@ mod structured;
 use scan::scan_tokens;
 pub use scan::{tokenize, tokenize_regex, tokenize_with, ScanRules, Token, TokenKind};
 #[cfg(feature = "structured")]
-pub use structured::HexFormat;
+pub use structured::{
+    BigElement, Character, CompactStr, Hex, HexFormat, Parser, Recognizer, StructuredLine,
+    TextElement, WithStore,
+};
 
 const EMPTY_STR: &str = "";
 const PATH_SEP: &str = "/";
