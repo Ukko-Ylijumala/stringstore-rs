@@ -33,7 +33,7 @@ mod scan;
 mod structured;
 
 use scan::scan_tokens;
-pub use scan::{tokenize, tokenize_regex, Token};
+pub use scan::{tokenize, tokenize_regex, tokenize_with, ScanRules, Token, TokenKind};
 #[cfg(feature = "structured")]
 pub use structured::HexFormat;
 

@@ -78,7 +78,7 @@ Any ten-digit integer is a plausible Unix timestamp; nothing in the token says s
              no store)       input, no store)          per line)
 ```
 
-- **Scanner.** `scan_tokens` extended with the `ByteClass` variants planned in `tokenization.md`: a whitespace (or any caller-defined) character class whose runs collapse into one `Character(_, n)` delimiter, and enclosure pairs that suppress splitting between `Open` and `Close`. The entry points `tokenize` / `split_and_store_multi` are unchanged by this.
+- **Scanner.** `scan` with a `ScanRules`: literal delimiters, run characters (a maximal run of one ASCII byte is one piece, which the parser turns into `Character(_, n)` — a `Delimiter` for whitespace, a `Char` otherwise) and enclosure pairs that suppress splitting between `Open` and `Close`. See `tokenization.md`. The entry points `tokenize` / `split_and_store_multi` are unchanged by this.
 - **Recognizers.** Pure functions `fn(&str) -> Option<Recognized>` where `Recognized<'a>` is a small enum over borrowed slices and native values (no interning yet). They run in a configured order on each non-delimiter slice, first match wins, then the re-render check of decision 1. Being store-free, they are tested on bare strings.
 - **Interning.** One pass maps `Recognized<'a>` to `TextElement` by interning every slice it still holds. Collect the slices and use `insert_many` so the writer mutex is taken once per line (see `concurrency.md`).
 - **Config.** A `Parser` built with a builder: delimiters, whitespace class, enclosure pairs, the recognizer set and its order, timestamp policy. `parser.parse(&store, line) -> StructuredLine`.
@@ -101,7 +101,7 @@ The exact list grows with the recognizers; keep it in this table.
 Each step is independently testable and leaves the crate building with no new dead code.
 
 1. **Data model** (decisions 2–7) — *done.* Slimmed the enum, added `BigElement`, flattened enclosures, dropped the generic and the `Arc`, interned raw text, split IPv4 from IPv6, pinned the size with a `const` assertion, gave `HexFormat` its width. No unsafe, no concurrency.
-2. **Scanner extensions**: the whitespace-class delimiter with run counting, then enclosure pairs. Pure code, checked against the `reference_tokenize` oracle in the test module extended with the new rules.
+2. **Scanner extensions** — *done.* `ScanRules` with run characters (a run is one `Run` piece, its length the count) and enclosure pairs (nesting for distinct pairs, unterminated runs to the end), `tokenize_with`, `TokenKind`; checked against a char-by-char `reference_scan` oracle. See `tokenization.md`.
 3. **Unambiguous recognizers**: integer, float, prefixed hex, IPv4/IPv6 via `std::net` parsing, `YYYY-MM-DD`, `HH:MM:SS`, `key=value`. Plus the re-render check.
 4. **`Parser` and `parse`**: wire the three stages, with a property test that random log-like lines round-trip through `Display` byte for byte.
 5. **Heuristic recognizers**: hostname, email, URL, sentence, date-time to `Timestamp`. Each needs a dictionary, a config or context; each lands without touching steps 1–4.

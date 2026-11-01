@@ -29,7 +29,7 @@ Three source files. `src/lib.rs` holds the store and everything around it; `src/
 | `return_iso8859_1_cp` | Utility helper |
 | `StringStoreError`, `StringStoreResult` | Error types |
 | `mod tests` | Inline test module |
-| `src/scan.rs`: `ByteClass`, `ScanTable`, `scan_tokens`, `tokenize`, `tokenize_regex`, `Token` | The byte-class scanner and its entry points, used by `split_and_store_multi` (`tokenize_regex` is an alias of `tokenize`) |
+| `src/scan.rs`: `ScanRules`, `Scanned`, `ByteClass`, `ScanTable`, `scan`, `scan_tokens`, `tokenize`, `tokenize_with`, `tokenize_regex`, `Token`, `TokenKind` | The byte-class scanner (literal delimiters, run characters, enclosures) and its entry points, used by `split_and_store_multi` (`tokenize_regex` is an alias of `tokenize`) |
 | `src/structured.rs`: `CompactStr`, `Character`, `TextElement`, `BigElement`, `StructuredLine`, `Hex`, `HexFormat` | **Dormant scaffolding** for a structured-text feature; only `HexFormat` is exported, only the formatting is tested. The data model follows `doc/design/structured-text.md` (step 1 done); the parser does not exist yet |
 
 ## Design documentation
@@ -39,7 +39,7 @@ The design of the non-obvious bits lives in [`doc/design/`](doc/design/README.md
 - **[Storage architecture](doc/design/storage-architecture.md)** — the three-container split (`ascii` + `store` + `index`), the arena that holds the string bytes, and the load-bearing `LATIN1_NUM = 256` offset between public and internal indices. Required reading before touching anything index-related.
 - **[Concurrency model](doc/design/concurrency.md)** — lock-free reads over the slot table, the writer mutex + DashMap lock ordering, the post-lock recheck in `insert_unchecked`, and the one in-flight index readers may have to wait for. Required reading before changing the insert or read paths.
 - **[Unsafe pointer surface](doc/design/unsafe-pointers.md)** — `borrow_str`, `StoredStrPtr`, and the append-only invariant that keeps them sound. Required reading before adding any removal/mutation API.
-- **[Tokenization](doc/design/tokenization.md)** — the byte-class scanner, its leftmost-first contract, why byte-wise stepping is UTF-8 safe, the empty-delimiter footgun, and where richer tokenization rules should plug in.
+- **[Tokenization](doc/design/tokenization.md)** — the byte-class scanner, its three splitting rules (literal delimiters, run characters, enclosures) and their precedence, why byte-wise stepping is UTF-8 safe, the empty-delimiter footgun, and where further rules plug in.
 - **[Splitting and paths](doc/design/splitting-and-paths.md)** — sentinel-zero encoding shared by `split_and_store`, `store_path`, and `reconstruct`.
 - **[Structured text](doc/design/structured-text.md)** — *design only, nothing implemented.* The target data model (16-byte `TextElement` with a `Big(Box<Big>)` overflow variant, no `Arc` in lines, no generic integer), the lossless-by-re-rendering rule, the scan → recognize → intern pipeline, and the step order. Required reading before touching the dormant scaffolding below.
 

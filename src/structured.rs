@@ -441,8 +441,8 @@ impl Debug for WithStore<'_, BigElement> {
 A unit of structured text, which can be a line or a block: the elements,
 and nothing else. It holds no store reference (that would cost a pointer
 per line over millions of lines); pair it with the store through
-`with_store` for formatting, the way [StoredStr] pairs an index with its
-store. The derived `Debug` shows raw indices; `with_store` resolves them.
+`with_store` for formatting, the way [StoredStr](crate::StoredStr) pairs an
+index with its store. The derived `Debug` shows raw indices; `with_store` resolves them.
 */
 #[derive(Debug, Default, PartialEq)]
 struct StructuredLine {
