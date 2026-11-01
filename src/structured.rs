@@ -697,7 +697,14 @@ A rule that turns a piece of text into a value. The [Parser] runs its
 recognizers in order on every text piece and takes the first that
 claims it *and* renders back to the exact piece (see [Parser]); the
 order therefore settles the overlaps, which is what [Recognizer::DEFAULT]
-does for the unambiguous set.
+does for the unambiguous set and [Recognizer::ALL] for everything.
+
+The first group is unambiguous: a piece either has the shape or it does
+not. The second is heuristic — a hostname is just dotted labels, so
+`file.txt` is one too — and off unless asked for. The last two are not
+recognizers of single pieces but passes over the parsed line, merging
+runs of elements into one; they are listed here so that one slice
+configures the whole parser.
 */
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -719,6 +726,29 @@ pub enum Recognizer {
     /// value (which may be empty); no whitespace on either side, so the
     /// body of an enclosure with spaces in it stays raw text.
     KeyVal,
+    /// *Heuristic.* `scheme://authority/path?query` with no `#`: a
+    /// [BigElement::URLStr] of the scheme, the authority and the path
+    /// split at its slashes, plus a [BigElement::URLParams] of the
+    /// `&`-separated query if there is one — two elements for one piece.
+    Url,
+    /// *Heuristic.* `local@domain.tld`: a local part of letters, digits
+    /// and `._%+-`, then a hostname (see `Hostname`).
+    Email,
+    /// *Heuristic.* `user@host`: like `Email`, but the host is a single
+    /// label (no dot).
+    Username,
+    /// *Heuristic.* Two or more dot-separated labels of letters, digits
+    /// and inner dashes (1–63 bytes each), the last one alphabetic and at
+    /// least two long: `www.example.org`, but also `file.txt`.
+    Hostname,
+    /// *Pass over the line.* A `Day`, one space and a `Time` become one
+    /// `Timestamp`, read as UTC — when the result renders back the same,
+    /// so an impossible date (`2026-02-31`) or one before 1970 stays as
+    /// it was.
+    Timestamp,
+    /// *Pass over the line.* Two or more `Word`s separated by single
+    /// spaces become one `Sentence`.
+    Sentence,
 }
 
 impl Recognizer {
@@ -736,7 +766,28 @@ impl Recognizer {
         Recognizer::KeyVal,
     ];
 
+    /// Every recognizer, the heuristic ones and the passes included, in
+    /// an order that resolves their overlaps: a URL before a key-value
+    /// pair (its query has `=`), the `@` shapes and hostnames after the
+    /// numbers (`1.5` is a float, not a host).
+    pub const ALL: &'static [Recognizer] = &[
+        Recognizer::Ip,
+        Recognizer::Day,
+        Recognizer::Time,
+        Recognizer::Integer,
+        Recognizer::Float,
+        Recognizer::Hex,
+        Recognizer::Url,
+        Recognizer::Email,
+        Recognizer::Username,
+        Recognizer::Hostname,
+        Recognizer::KeyVal,
+        Recognizer::Timestamp,
+        Recognizer::Sentence,
+    ];
+
     /// Run this recognizer on `text`; `None` if it does not claim it.
+    /// The passes (`Timestamp`, `Sentence`) claim nothing here.
     fn apply<'a>(self, text: &'a str) -> Option<Recognized<'a>> {
         let scalar = |elem: TextElement| Some(Recognized::Scalar(elem));
         match self {
@@ -798,6 +849,18 @@ impl Recognizer {
                 let plain: bool = !key.is_empty() && !text.bytes().any(|b| b.is_ascii_whitespace());
                 plain.then_some(Recognized::KeyVal(key, value))
             }
+            Self::Url => split_url(text).map(|(parts, params)| Recognized::Url(parts, params)),
+            Self::Email => {
+                let (local, domain) = text.split_once('@')?;
+                (is_email_local(local) && is_hostname(domain))
+                    .then_some(Recognized::Email(local, domain))
+            }
+            Self::Username => {
+                let (user, host) = text.split_once('@')?;
+                (is_email_local(user) && is_label(host)).then_some(Recognized::Username(user, host))
+            }
+            Self::Hostname => is_hostname(text).then_some(Recognized::Hostname(text)),
+            Self::Timestamp | Self::Sentence => None,
         }
     }
 }
@@ -809,13 +872,154 @@ fn digits(b: &[u8]) -> Option<u32> {
     })
 }
 
+/// A hostname label: 1–63 letters, digits or dashes, no dash at either end.
+fn is_label(s: &str) -> bool {
+    (1..=63).contains(&s.len())
+        && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        && !s.starts_with('-')
+        && !s.ends_with('-')
+}
+
+/// Two or more labels, the last alphabetic and at least two long.
+fn is_hostname(s: &str) -> bool {
+    let mut labels = s.split('.').peekable();
+    let mut count: usize = 0;
+    while let Some(label) = labels.next() {
+        if !is_label(label) {
+            return false;
+        }
+        count += 1;
+        if labels.peek().is_none() {
+            return count >= 2
+                && label.len() >= 2
+                && label.bytes().all(|b| b.is_ascii_alphabetic());
+        }
+    }
+    false
+}
+
+/// The local part of an email address, loosely: letters, digits and `._%+-`.
+fn is_email_local(s: &str) -> bool {
+    !s.is_empty()
+        && !s.starts_with('.')
+        && !s.ends_with('.')
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._%+-".contains(&b))
+}
+
+/**
+Split `scheme://authority/path?query` into parts that concatenate back
+to it: `scheme://`, the authority, then `/` and each path segment in
+turn, and separately the `&`-separated query parameters if there is a
+`?`. `None` for anything else, including a fragment (`#`), which the
+two-element representation cannot place.
+*/
+fn split_url(text: &str) -> Option<(Vec<&str>, Option<Vec<&str>>)> {
+    let (scheme, rest) = text.split_once("://")?;
+    let first: u8 = *scheme.as_bytes().first()?;
+    let scheme_ok: bool = first.is_ascii_alphabetic()
+        && scheme
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"+-.".contains(&b));
+    if !scheme_ok || rest.is_empty() || text.bytes().any(|b| b.is_ascii_whitespace() || b == b'#') {
+        return None;
+    }
+    let (location, query) = match rest.split_once('?') {
+        Some((location, query)) => (location, Some(query)),
+        None => (rest, None),
+    };
+    let (authority, path) = match location.find('/') {
+        Some(slash) => (&location[..slash], &location[slash..]),
+        None => (location, ""),
+    };
+    if authority.is_empty() {
+        return None;
+    }
+
+    let mut parts: Vec<&str> = vec![&text[..scheme.len() + 3], authority];
+    // "/a/b/" -> "/", "a", "/", "b", "/": the slashes are Latin-1, free to intern
+    for segment in path.split('/').skip(1) {
+        parts.push("/");
+        if !segment.is_empty() {
+            parts.push(segment);
+        }
+    }
+    Some((parts, query.map(|q| q.split('&').collect())))
+}
+
+/// Days since 1970-01-01 of a proleptic Gregorian date (Howard Hinnant's
+/// `days_from_civil`); the date need not be valid, it is normalized.
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y: i64 = if m <= 2 { y - 1 } else { y };
+    let era: i64 = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe: u64 = (y - era * 400) as u64; // [0, 399]
+    let mp: u64 = u64::from((m + 9) % 12); // March is 0
+    let doy: u64 = (153 * mp + 2) / 5 + u64::from(d) - 1;
+    let doe: u64 = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe as i64 - 719_468
+}
+
+/// Seconds since the Unix epoch of a UTC date and time; `None` before 1970.
+fn epoch_seconds(y: i16, m: u8, d: u8, h: u8, min: u8, s: u8) -> Option<u64> {
+    let days: i64 = days_from_civil(i64::from(y), u32::from(m), u32::from(d));
+    let secs: i64 = days * 86_400 + i64::from(h) * 3600 + i64::from(min) * 60 + i64::from(s);
+    u64::try_from(secs).ok()
+}
+
 /// What a [Recognizer] made of a text piece: either a finished value with
 /// no string parts, or a shape whose strings still have to be interned.
+/// `strs` lists those strings in the order `into_elements` consumes
+/// their indices; keep the two in step.
 enum Recognized<'a> {
     /// A value with no string parts; final, once it passes the re-render check.
     Scalar(TextElement),
     /// `key=value`, both still to be interned.
     KeyVal(&'a str, &'a str),
+    Hostname(&'a str),
+    /// `user@host`.
+    Username(&'a str, &'a str),
+    /// `local@domain`.
+    Email(&'a str, &'a str),
+    /// The parts of a URL and, if it has a query, its parameters.
+    Url(Vec<&'a str>, Option<Vec<&'a str>>),
+}
+
+impl<'a> Recognized<'a> {
+    /// Push the strings this value needs interned, in order.
+    fn strs(&self, out: &mut Vec<&'a str>) {
+        match self {
+            Self::Scalar(_) => {}
+            Self::KeyVal(a, b) | Self::Username(a, b) | Self::Email(a, b) => out.extend([a, b]),
+            Self::Hostname(h) => out.push(h),
+            Self::Url(parts, params) => {
+                out.extend(parts);
+                if let Some(params) = params {
+                    out.extend(params);
+                }
+            }
+        }
+    }
+
+    /// Build the element(s), taking the interned indices from `idx` in
+    /// the order `strs` listed the strings.
+    fn into_elements(self, idx: &mut impl Iterator<Item = CompactStr>, out: &mut Vec<TextElement>) {
+        let mut next = || idx.next().expect("one index per string listed by `strs`");
+        match self {
+            Self::Scalar(elem) => out.push(elem),
+            Self::KeyVal(_, _) => out.push(TextElement::KeyVal(next(), next())),
+            Self::Hostname(_) => out.push(TextElement::Hostname(next())),
+            Self::Username(_, _) => out.push(TextElement::Username(next(), next())),
+            Self::Email(_, _) => out.push(TextElement::Email(next(), next())),
+            Self::Url(parts, params) => {
+                out.push(TextElement::url(parts.iter().map(|_| next()).collect()));
+                if let Some(params) = params {
+                    out.push(TextElement::url_params(
+                        params.iter().map(|_| next()).collect(),
+                    ));
+                }
+            }
+        }
+    }
 }
 
 /* ################################ PARSER ################################# */
@@ -824,14 +1028,16 @@ enum Recognized<'a> {
 Turns a line of text into a [StructuredLine]: the scanner splits it by
 the [ScanRules], every text piece goes through the [Recognizer]s in
 order, and what is still a string is interned in one `insert_many`
-(one writer-mutex hold per line at most).
+(one writer-mutex hold per line at most). The passes among the
+recognizers (`Timestamp`, `Sentence`) then run over the elements.
 
 **Lossless.** A recognized value is kept only when rendering it back
 gives the exact piece it came from; otherwise the next recognizer gets a
 go, and if none fits the piece is interned as a `Word` (or `RawText`,
 for the body of an enclosure). `007`, `+5`, `2.50`, `1e5` and `0xDeAd`
 therefore stay words, and `line.with_store(&store).to_string()` is
-always the input, byte for byte.
+always the input, byte for byte. The passes merge only what renders back
+the same, too.
 
 **Runs and enclosures.** A run of a whitespace run character becomes a
 `Delimiter(Character(_, n))`, any other run a `Char`; a run longer than
@@ -896,11 +1102,19 @@ impl<'r> Parser<'r> {
         }
         let indices: Vec<u32> = store.insert_many(&strs);
         let mut next = indices.into_iter().map(CompactStr);
-        let elems: Vec<TextElement> = pending
-            .into_iter()
-            .map(|p| p.into_element(&mut next))
-            .collect();
+        let mut elems: Vec<TextElement> = Vec::with_capacity(pending.len());
+        for p in pending {
+            p.into_elements(&mut next, &mut elems);
+        }
         debug_assert!(next.next().is_none(), "every interned string must be used");
+
+        // the passes, timestamps first: a Day or Time is never a Word anyway
+        if self.recognizers.contains(&Recognizer::Timestamp) {
+            elems = merge_timestamps(elems, &mut buf);
+        }
+        if self.recognizers.contains(&Recognizer::Sentence) {
+            elems = merge_sentences(elems);
+        }
         StructuredLine { elems }
     }
 
@@ -917,16 +1131,17 @@ impl<'r> Parser<'r> {
         for recognizer in self.recognizers {
             match recognizer.apply(text) {
                 None => continue,
-                Some(Recognized::KeyVal(k, v)) => return Pending::KeyVal(k, v),
                 Some(Recognized::Scalar(elem)) => {
                     // a scalar reads nothing from the store; it just needs the type
                     buf.clear();
                     write!(buf, "{}", elem.with_store(store)).expect("String never fails");
                     if buf == text {
-                        return Pending::Done(elem);
+                        return Pending::Recognized(Recognized::Scalar(elem));
                     }
                     // lossy spelling: let the next recognizer try, else a word
                 }
+                // the shapes with string parts render back by construction
+                Some(shape) => return Pending::Recognized(shape),
             }
         }
         if enclosed {
@@ -964,7 +1179,7 @@ impl Default for Parser<'static> {
 
 /**
 An element of a line being parsed, before its strings are interned.
-`strs` lists the strings in the order `into_element` consumes their
+`strs` lists the strings in the order `into_elements` consumes their
 indices; keep the two in step.
 */
 enum Pending<'a> {
@@ -975,9 +1190,8 @@ enum Pending<'a> {
     Char(&'a str, u8),
     Open(&'a str),
     Close(&'a str),
-    KeyVal(&'a str, &'a str),
-    /// A finished scalar element.
-    Done(TextElement),
+    /// What a recognizer made of the piece.
+    Recognized(Recognized<'a>),
 }
 
 impl<'a> Pending<'a> {
@@ -990,26 +1204,113 @@ impl<'a> Pending<'a> {
             | Self::Char(s, _)
             | Self::Open(s)
             | Self::Close(s) => out.push(s),
-            Self::KeyVal(k, v) => out.extend([k, v]),
-            Self::Done(_) => {}
+            Self::Recognized(r) => r.strs(out),
         }
     }
 
-    /// Build the element, taking its interned indices from `idx` in the
-    /// order `strs` listed the strings.
-    fn into_element(self, idx: &mut impl Iterator<Item = CompactStr>) -> TextElement {
+    /// Build the element(s), taking the interned indices from `idx` in
+    /// the order `strs` listed the strings.
+    fn into_elements(self, idx: &mut impl Iterator<Item = CompactStr>, out: &mut Vec<TextElement>) {
         let mut next = || idx.next().expect("one index per string listed by `strs`");
         match self {
-            Self::Word(_) => TextElement::Word(next()),
-            Self::RawText(_) => TextElement::RawText(next()),
-            Self::Delimiter(_, n) => TextElement::Delimiter(Character(next(), n)),
-            Self::Char(_, n) => TextElement::Char(Character(next(), n)),
-            Self::Open(_) => TextElement::Open(Character(next(), 1)),
-            Self::Close(_) => TextElement::Close(Character(next(), 1)),
-            Self::KeyVal(_, _) => TextElement::KeyVal(next(), next()),
-            Self::Done(elem) => elem,
+            Self::Word(_) => out.push(TextElement::Word(next())),
+            Self::RawText(_) => out.push(TextElement::RawText(next())),
+            Self::Delimiter(_, n) => out.push(TextElement::Delimiter(Character(next(), n))),
+            Self::Char(_, n) => out.push(TextElement::Char(Character(next(), n))),
+            Self::Open(_) => out.push(TextElement::Open(Character(next(), 1))),
+            Self::Close(_) => out.push(TextElement::Close(Character(next(), 1))),
+            Self::Recognized(r) => r.into_elements(idx, out),
         }
     }
+}
+
+/// Whether the element is exactly one space: the Latin-1 table puts the
+/// single characters at their codepoint, so the space is index 32.
+fn is_single_space(elem: &TextElement) -> bool {
+    matches!(elem, TextElement::Delimiter(c) if c.idx() == u32::from(b' ') && c.num() == 1)
+}
+
+/**
+The `Timestamp` pass: a `Day`, a single space and a `Time` become one
+`Timestamp` (UTC), when it renders back to the same text — which rules
+out dates the calendar normalizes (`2026-02-31`), years before 1970 and
+years under 1000 (`SecondsSinceEpoch` prints them unpadded).
+*/
+fn merge_timestamps(elems: Vec<TextElement>, buf: &mut String) -> Vec<TextElement> {
+    let mut merges: Vec<(usize, usize, TextElement)> = Vec::new();
+    for i in 0..elems.len().saturating_sub(2) {
+        let (TextElement::Day(y, m, d), TextElement::Time(h, min, s)) = (&elems[i], &elems[i + 2])
+        else {
+            continue;
+        };
+        if !is_single_space(&elems[i + 1]) {
+            continue;
+        }
+        let Some(secs) = epoch_seconds(*y, *m, *d, *h, *min, *s) else {
+            continue;
+        };
+        let ts: SecondsSinceEpoch = SecondsSinceEpoch::from(secs);
+        buf.clear();
+        write!(buf, "{ts}").expect("String never fails");
+        if *buf == format!("{y:04}-{m:02}-{d:02} {h:02}:{min:02}:{s:02}") {
+            merges.push((i, 3, TextElement::Timestamp(ts)));
+        }
+    }
+    rebuild(elems, merges)
+}
+
+/// The `Sentence` pass: a maximal run of two or more `Word`s separated by
+/// single spaces becomes one `Sentence`.
+fn merge_sentences(elems: Vec<TextElement>) -> Vec<TextElement> {
+    let word = |elem: &TextElement| match elem {
+        TextElement::Word(w) => Some(*w),
+        _ => None,
+    };
+    let mut merges: Vec<(usize, usize, TextElement)> = Vec::new();
+    let mut i: usize = 0;
+    while i < elems.len() {
+        if word(&elems[i]).is_none() {
+            i += 1;
+            continue;
+        }
+        // extend over (space, word) pairs
+        let mut end: usize = i + 1;
+        while end + 1 < elems.len()
+            && is_single_space(&elems[end])
+            && word(&elems[end + 1]).is_some()
+        {
+            end += 2;
+        }
+        if end - i >= 3 {
+            let words: Vec<CompactStr> = elems[i..end].iter().filter_map(word).collect();
+            merges.push((i, end - i, TextElement::sentence(words)));
+        }
+        i = end;
+    }
+    rebuild(elems, merges)
+}
+
+/// Replace each `(start, len, elem)` run of `elems` by `elem`; the runs
+/// are in order and do not overlap.
+fn rebuild(elems: Vec<TextElement>, merges: Vec<(usize, usize, TextElement)>) -> Vec<TextElement> {
+    if merges.is_empty() {
+        return elems;
+    }
+    let mut out: Vec<TextElement> = Vec::with_capacity(elems.len());
+    let mut merges = merges.into_iter().peekable();
+    let mut skip: usize = 0;
+    for (i, elem) in elems.into_iter().enumerate() {
+        if merges.peek().is_some_and(|(start, _, _)| *start == i) {
+            let (_, len, merged) = merges.next().expect("peeked");
+            out.push(merged);
+            skip = len - 1;
+        } else if skip > 0 {
+            skip -= 1;
+        } else {
+            out.push(elem);
+        }
+    }
+    out
 }
 
 /* ################################ TESTS ################################## */
@@ -1369,7 +1670,7 @@ mod tests {
         enclosures (nested, empty, unterminated). Deterministic LCG so a
         failure is reproducible from the seed.
         */
-        const POOL: [&str; 48] = [
+        const POOL: [&str; 60] = [
             "GET", "error", "user", "a", "ümlaut", "日本",
             "42", "-7", "007", "+3", "3.14", "2.50", "1e5", "-0", "99999999999999999999",
             "10.0.0.1", "fe80::1", "::1", "256.1.1.1", "fe80:0:0:0:0:0:0:1",
@@ -1378,11 +1679,15 @@ mod tests {
             "k=v", "k=", "=v", "a=b=c",
             " ", "  ", "\t", ", ", ";", "***", "---",
             "\"quoted text\"", "[2026-11-01]", "(a (b) c)", "\"unterminated", "[]",
+            "john.doe@example.org", "john@workstation", "www.example.org", "file.txt", "v1.2.3", "a@b@c",
+            "https://www.example.org:8080/path/to/file.html?x=1&y=2", "http://x", "http://", "http://x#f",
+            "2026-11-01 07:05:00", "Mary had a little lamb",
         ];
         let store: UniqueStrStore = UniqueStrStore::new();
         let pairs: [(&str, &str); 3] = [("\"", "\""), ("[", "]"), ("(", ")")];
         let rules: ScanRules<'_> = ScanRules::new(&[",", ";"]).runs(" \t*-").enclosures(&pairs);
-        let parser: Parser<'_> = Parser::new(rules);
+        let default: Parser<'_> = Parser::new(rules);
+        let all: Parser<'_> = Parser::new(rules).recognizers(Recognizer::ALL);
         let mut seed: u64 = 11;
         let mut next = move |modulus: u64| -> usize {
             seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
@@ -1391,11 +1696,185 @@ mod tests {
 
         for case in 0..3000 {
             let text: String = (0..next(12)).map(|_| POOL[next(POOL.len() as u64)]).collect();
-            let line: StructuredLine = parser.parse(&store, &text);
-            assert_eq!(line.with_store(&store).to_string(), text, "case {case}");
-            // and a reparse is the same line
-            assert_eq!(parser.parse(&store, &text), line, "case {case}: parsing must be deterministic");
+            for parser in [&default, &all] {
+                let line: StructuredLine = parser.parse(&store, &text);
+                assert_eq!(line.with_store(&store).to_string(), text, "case {case}");
+                // and a reparse is the same line
+                assert_eq!(parser.parse(&store, &text), line, "case {case}: parsing must be deterministic");
+            }
         }
         store.validate_contents().expect("store consistent after parsing");
+    }
+
+    /// Parse `text` as a whole piece with every recognizer; the elements' legible `Debug`.
+    fn all(store: &UniqueStrStore, text: &str) -> Vec<String> {
+        let parser: Parser<'_> = Parser::new(ScanRules::new(&[])).recognizers(Recognizer::ALL);
+        let line: StructuredLine = parser.parse(store, text);
+        assert_eq!(
+            line.with_store(store).to_string(),
+            text,
+            "round trip of {text:?}"
+        );
+        dbg(&line, store)
+    }
+
+    #[rustfmt::skip]
+    #[test]
+    fn test_heuristic_recognizers() {
+        let store: UniqueStrStore = UniqueStrStore::new();
+        let kind = |text: &str| -> String {
+            let got: Vec<String> = all(&store, text);
+            assert_eq!(got.len(), 1, "{text:?} must be one element: {got:?}");
+            got.into_iter().next().unwrap()
+        };
+        let starts = |text: &str, prefix: &str| {
+            let got: String = kind(text);
+            assert!(got.starts_with(prefix), "{text:?}: got {got}, want {prefix}…");
+            got
+        };
+
+        assert!(starts("john.doe@example.org", "Email(").contains("\"example.org\""));
+        assert!(starts("john+tag@mail.example.co.uk", "Email(").contains("\"john+tag\""));
+        starts("john@workstation", "Username(");
+        starts("www.example.org", "Hostname(");
+        starts("file.txt", "Hostname("); // the heuristic's known false positive
+        starts("a-b.example-site.org", "Hostname(");
+        // not hostnames: a numeric or one-letter last label, empty or dashed labels, one label
+        for text in ["v1.2.3", "example.org.", ".org", "-bad.org", "bad-.org", "a.b", "localhost", "x..y",
+                     &format!("{}.org", "a".repeat(64))] {
+            starts(text, "Word(");
+        }
+        // not addresses: two @, empty sides, a dot at the local part's edge, a dotted host for Username
+        for text in ["a@b@c", "@example.org", "john@", ".john@example.org", "john@-x", "jo hn@x"] {
+            starts(text, "Word(");
+        }
+        // the default set and the heuristics do not fight: numbers stay numbers
+        assert_eq!(kind("1.5"), "Float(1.5)");
+        assert_eq!(kind("10.0.0.1"), "IPv4(10.0.0.1)");
+        assert!(starts("k=v", "KeyVal(").contains("\"v\""));
+        // and these heuristics are off by default
+        assert!(format!("{:?}", one(&store, "www.example.org").with_store(&store)).starts_with("Word("));
+    }
+
+    #[rustfmt::skip]
+    #[test]
+    fn test_url_recognizer() {
+        let store: UniqueStrStore = UniqueStrStore::new();
+
+        // a URL with a query is two elements: the parts and the parameters
+        let got: Vec<String> = all(&store, "https://www.example.org:8080/path/to/file.html?x=1&y=2");
+        assert_eq!(got.len(), 2, "{got:?}");
+        for part in ["\"https://\"", "\"www.example.org:8080\"", "\"/\"", "\"path\"", "\"to\"", "\"file.html\""] {
+            assert!(got[0].contains(part), "{part} in {}", got[0]);
+        }
+        assert!(got[0].starts_with("URLStr([") && !got[0].contains("\"/path\""), "{}", got[0]);
+        assert!(got[1].starts_with("URLParams([") && got[1].contains("\"x=1\"") && got[1].contains("\"y=2\""), "{}", got[1]);
+        // the slashes are the Latin-1 "/" and the segments plain words: nothing URL-specific interned
+        assert!(store.contains("path") && store.contains("https://") && !store.contains("/path"));
+
+        // no query: one element; trailing slash, empty query, empty parameters all exact
+        for text in ["http://x", "ftp://host/", "http://x/a//b/", "http://x?", "http://x?a&&b", "a+b-c.d://x"] {
+            let got: Vec<String> = all(&store, text);
+            assert!(got[0].starts_with("URLStr("), "{text:?}: {got:?}");
+        }
+        assert_eq!(all(&store, "http://x?").len(), 2);
+        // a query with "=" is a URL, not a key-value pair (order in ALL)
+        assert!(all(&store, "http://x?a=b")[0].starts_with("URLStr("));
+        // not URLs: no authority, a fragment, whitespace, a bad scheme
+        for text in ["http://", "http:///x", "http://x#f", "://x", "1http://x", "ht tp://x", "http:/x"] {
+            let got: Vec<String> = all(&store, text);
+            assert!(got.len() == 1 && got[0].starts_with("Word("), "{text:?}: {got:?}");
+        }
+    }
+
+    #[test]
+    fn test_timestamp_pass() {
+        let store: UniqueStrStore = UniqueStrStore::new();
+        let parser: Parser<'_> =
+            Parser::new(ScanRules::new(&[]).runs(" ")).recognizers(Recognizer::ALL);
+
+        let line: StructuredLine = parser.parse(&store, "2026-11-01 07:05:00 x");
+        assert_eq!(line.with_store(&store).to_string(), "2026-11-01 07:05:00 x");
+        assert_eq!(line.len(), 3, "{:?}", dbg(&line, &store));
+        match line.elements()[0] {
+            TextElement::Timestamp(ts) => assert_eq!(ts.get(), 1_793_516_700),
+            ref other => panic!("not a timestamp: {:?}", other.with_store(&store)),
+        }
+        let epoch: StructuredLine = parser.parse(&store, "1970-01-01 00:00:00");
+        assert!(matches!(epoch.elements()[0], TextElement::Timestamp(ts) if ts.get() == 0));
+        let leap: StructuredLine = parser.parse(&store, "2000-02-29 23:59:59");
+        assert!(
+            matches!(leap.elements()[0], TextElement::Timestamp(ts) if ts.get() == 951_868_799)
+        );
+
+        // stays as it was: an impossible date, before 1970, a year under 1000, two spaces
+        for text in [
+            "2026-02-31 07:05:00",
+            "1969-12-31 23:59:59",
+            "0999-12-31 00:00:00",
+            "2026-11-01  07:05:00",
+        ] {
+            let line: StructuredLine = parser.parse(&store, text);
+            assert_eq!(line.with_store(&store).to_string(), text);
+            assert_eq!(line.len(), 3, "{text:?}: {:?}", dbg(&line, &store));
+            assert!(
+                matches!(line.elements()[0], TextElement::Day(..)),
+                "{text:?}"
+            );
+        }
+        // and without the pass in the list
+        let plain: StructuredLine =
+            Parser::new(ScanRules::new(&[]).runs(" ")).parse(&store, "2026-11-01 07:05:00");
+        assert_eq!(plain.len(), 3);
+    }
+
+    #[test]
+    fn test_sentence_pass() {
+        let store: UniqueStrStore = UniqueStrStore::new();
+        let parser: Parser<'static> = Parser::default().recognizers(Recognizer::ALL);
+
+        let text: &str = "Mary had a little lamb. Its fleece 42 was  white \"as snow\"";
+        let line: StructuredLine = parser.parse(&store, text);
+        assert_eq!(line.with_store(&store).to_string(), text);
+        let got: Vec<String> = dbg(&line, &store);
+        assert!(got[0].starts_with("Sentence(["), "{}", got[0]);
+        assert!(
+            got[0].contains("\"Mary\"")
+                && got[0].contains("\"lamb.\"")
+                && got[0].contains("\"fleece\"")
+        );
+        assert!(
+            matches!(line.elements()[0].as_big(), Some(BigElement::Sentence(w)) if w.len() == 7)
+        );
+        assert!(matches!(line.elements()[2], TextElement::Integer(42)));
+        // a lone word, words around a double space, and raw text are not merged
+        assert!(
+            got[4].starts_with("Word(") && got[4].contains("\"was\""),
+            "{}",
+            got[4]
+        );
+        assert!(
+            got[6].starts_with("Word(") && got[6].contains("\"white\""),
+            "{}",
+            got[6]
+        );
+        assert!(got[9].starts_with("RawText("), "{}", got[9]);
+        assert_eq!(line.len(), 11, "{got:#?}");
+
+        let two: StructuredLine = parser.parse(&store, "a b");
+        assert_eq!(two.len(), 1);
+        let one: StructuredLine = parser.parse(&store, "a");
+        assert!(matches!(one.elements()[0], TextElement::Word(_)));
+    }
+
+    #[test]
+    fn test_days_from_civil() {
+        assert_eq!(days_from_civil(1970, 1, 1), 0);
+        assert_eq!(days_from_civil(1969, 12, 31), -1);
+        assert_eq!(days_from_civil(2000, 3, 1), 11_017);
+        assert_eq!(days_from_civil(2026, 11, 1), 20_758);
+        assert_eq!(days_from_civil(1600, 1, 1), -135_140);
+        assert_eq!(epoch_seconds(2026, 11, 1, 7, 5, 0), Some(1_793_516_700));
+        assert_eq!(epoch_seconds(1969, 12, 31, 23, 59, 59), None);
     }
 }

@@ -1,6 +1,6 @@
 # Structured text
 
-**Status: parser with the unambiguous recognizers; heuristic recognizers pending.** `src/structured.rs` (behind the `structured` feature, on by default) holds the data model (`TextElement`, `BigElement`, `StructuredLine`, `CompactStr`, `Character`, `Hex`, `HexFormat`), the `Recognizer`s and the `Parser` — steps 1–4 and 6 of the implementation order. Step 5 (hostnames, emails, URLs, sentences, timestamps) is not done: those variants render but nothing produces them from text. The shapes are still unstable (`#[non_exhaustive]`); the open questions at the end may move variants around.
+**Status: implemented through step 6.** `src/structured.rs` (behind the `structured` feature, on by default) holds the data model (`TextElement`, `BigElement`, `StructuredLine`, `CompactStr`, `Character`, `Hex`, `HexFormat`), the `Recognizer`s — the unambiguous set in `Recognizer::DEFAULT`, the heuristic ones and the two passes in `Recognizer::ALL` — and the `Parser`. Only `Range` has no recognizer. The shapes are still unstable (`#[non_exhaustive]`); the open questions at the end may move variants around.
 
 ## Goal
 
@@ -85,7 +85,7 @@ The sketch's `StructuredLine` holds an `Arc<UniqueStrStore>`. `UniqueStrStore` i
 
 ### Recognizer order and the ambiguities it resolves
 
-`Recognizer::DEFAULT` is `[Ip, Day, Time, Integer, Float, Hex, KeyVal]`. Keep this table in step with it.
+`Recognizer::DEFAULT` is `[Ip, Day, Time, Integer, Float, Hex, KeyVal]`; `Recognizer::ALL` inserts `Url, Email, Username, Hostname` before `KeyVal` and appends the passes `Timestamp, Sentence`. Keep this table in step with them.
 
 | Input | Wanted | Would otherwise be | Rule |
 |---|---|---|---|
@@ -97,6 +97,12 @@ The sketch's `StructuredLine` holds an `Arc<UniqueStrStore>`. `UniqueStrStore` i
 | `1730000000` | `Integer` | `Timestamp` | never (decision 8) |
 | `k=v` | `KeyVal` | `Word` | key-value last, and only without whitespace in the piece |
 | `len=0xff, t=1` | `RawText` | `KeyVal` | a piece with whitespace (an enclosure body) is not a key-value pair |
+| `http://x?a=b` | `URLStr` + `URLParams` | `KeyVal` | URL before key-value |
+| `1.5` | `Float` | `Hostname` (its last label is numeric anyway) | numbers before the `@` and dot shapes |
+| `john@example.org` | `Email` | `Username` | the host side has a dot: email; a single label: username |
+| `file.txt` | `Hostname` | — | the heuristic's known false positive; that is why it is not in `DEFAULT` |
+| `2026-11-01 07:05:00` | `Timestamp` | `Day`, space, `Time` | the pass merges only when the epoch value prints back the same text (UTC, 1000 ≤ year, calendar-valid) |
+| `Mary had a lamb` | `Sentence` | four `Word`s and three spaces | the pass merges maximal runs of words joined by single spaces |
 
 Known lossy spellings that stay `Word`, by design: `007`, `+5`, `2.50`, `100.0`, `1e5`, `.5`, `inf`/`NaN` (rejected before parsing, so a word in a log is never a float), `0X1F`, `0xdEaD` (mixed case), hex over 16 digits, `fe80:0:0:0:0:0:0:1` (Rust compresses it), `010.0.0.1` (Rust rejects it), `2026-13-01`, `24:00:00`, `7:05:00`.
 
@@ -108,11 +114,13 @@ Each step is independently testable and leaves the crate building with no new de
 2. **Scanner extensions** — *done.* `ScanRules` with run characters (a run is one `Run` piece, its length the count) and enclosure pairs (nesting for distinct pairs, unterminated runs to the end), `tokenize_with`, `TokenKind`; checked against a char-by-char `reference_scan` oracle. See `tokenization.md`.
 3. **Unambiguous recognizers** — *done.* Integer, float, prefixed hex, IPv4/IPv6 via `std::net` parsing, `YYYY-MM-DD`, `HH:MM:SS`, `key=value`, plus the re-render check.
 4. **`Parser` and `parse`** — *done.* The three stages wired, with `test_parse_round_trips` parsing 3000 generated log-like lines and checking they come back byte for byte.
-5. **Heuristic recognizers**: hostname, email, URL, sentence, and the `Day` + `Time` merge into `Timestamp`. Each needs a dictionary, a config or context, so none is in `Recognizer::DEFAULT`; each lands without touching steps 1–4.
+5. **Heuristic recognizers** — *done.* `Hostname`, `Email`, `Username`, `Url` (two elements: parts and parameters, the path split at `/` so segments dedupe with plain words), and the passes `Sentence` and `Timestamp` (the `Day` + space + `Time` merge, checked by re-rendering). None is in `Recognizer::DEFAULT`; `Recognizer::ALL` has them all in a working order.
 6. **Housekeeping** — *done early, so the parser lands in its final home.* The `structured` cargo feature (default on) gates `src/structured.rs` and makes `timesince` optional (it serves only `Timestamp`); the scanner moved to `src/scan.rs`. `lib.rs` keeps the store.
 
 ## Open questions
 
 - **Box vs side table for fat elements.** `Big(Box<Big>)` keeps elements self-contained and renderable from the store alone. The alternative, `Big(u32)` into a per-line `Vec<Big>`, saves one allocation per fat element but adds a Vec header to every line and forces `with_line` instead of `with_store`. The box is chosen; access logs (a URL per line) are the case that could overturn it. If it does, the cheaper fix is to flatten URL and sentence parts into one per-line `Vec<CompactStr>` and store `(start: u32, len: u16)` inline — 6 bytes — which keeps URLs out of the box entirely.
 - **Interning IPv6.** Addresses repeat (they are hosts), so `IPv6(CompactStr)` interning the canonical text may beat 16 raw bytes per occurrence and would make the variant inline. Decide with data once the parser exists.
-- **Sentence boundaries.** What makes a `Sentence` rather than a run of `Word`s is undefined in the sketch. Probably: a parser setting that merges word runs between configured punctuation. Low priority.
+- **Sentence boundaries.** The `Sentence` pass merges maximal runs of `Word`s joined by single spaces, so a trailing `lamb.` is just a word in the sentence and a number or a date ends it. Whether punctuation should end a sentence, or anything other than `Word` be allowed in, is open; the current rule is the one that is trivially exact.
+- **Range.** The only variant without a recognizer. `0-100` and `-15..10` collide with dates, negative numbers and version strings; it needs context (a key name, a unit) more than a shape.
+- **Escapes in enclosures.** `\\"` inside quotes ends the quote. Handling it needs the scanner to know escape characters, and the body would then not be a plain slice of the input.

@@ -40,7 +40,7 @@ The crate also provides:
 - `store_path` — normalize a filesystem path and intern each segment.
 - `reconstruct` — rebuild the original string from a slice of indices.
 - `StoredStr<'a>` — a safe handle that derefs to `&str`.
-- `Parser` — parses a line of log-like text into a `StructuredLine` of 16-byte `TextElement`s: words interned, numbers, IP addresses, dates, times and hex as native values, delimiters and enclosures kept. Lossless: `line.with_store(&store).to_string()` is the input. Feature `structured`, on by default.
+- `Parser` — parses a line of log-like text into a `StructuredLine` of 16-byte `TextElement`s: words interned, numbers, IP addresses, dates, times and hex as native values, delimiters and enclosures kept. Opt-in heuristics (`Recognizer::ALL`) add URLs, emails, hostnames, sentences and timestamps. Lossless: `line.with_store(&store).to_string()` is the input. Feature `structured`, on by default.
 - `tokenize_with` / `ScanRules` — the scanner behind it: literal delimiters, run characters and enclosure pairs.
 - `StoredStrPtr` — a raw-pointer handle for callers who can guarantee the store outlives the pointer.
 
