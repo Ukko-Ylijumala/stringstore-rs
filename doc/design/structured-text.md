@@ -1,6 +1,6 @@
 # Structured text
 
-**Status: design only.** Nothing in this document is implemented yet. `src/lib.rs` carries a 2024 sketch of the data model (`TextElement`, `StructuredLine`, `CompactStr`, `Character`, `Hex`, `HexFormat`, the `Integer` trait) that compiles under scoped `#[expect(dead_code)]` and has tests only for its `Display`/`Debug` output. This document records the decisions made on top of that sketch, where the sketch deviates from them, and the order in which the feature should be built. Rework the sketch freely to match it; its shapes were never meant to be final.
+**Status: data model done, no parser.** `src/lib.rs` carries the data model (`TextElement`, `BigElement`, `StructuredLine`, `CompactStr`, `Character`, `Hex`, `HexFormat`) reworked from a 2024 sketch to the decisions below — step 1 of the implementation order. It compiles under scoped `#[expect(dead_code)]` and has tests only for its layout and `Display`/`Debug` output; nothing produces a `StructuredLine` from text yet. The shapes are still unstable: the open questions at the end may move variants around.
 
 ## Goal
 
@@ -27,7 +27,7 @@ The mechanism is **verify by re-rendering**, not recording spellings: after a re
 - An **align-4 payload of up to 12 bytes** fits (`(u32, u32, u32)`), the tag taking the first 4 bytes.
 - Anything larger pushes the whole enum to 24, and the sketch today is **32 bytes** (`Vec<CompactStr>`, `String`, `Range(i64, i64, _)`, `IpAddr` at 17 bytes). A 20-element line costs ~650 bytes against ~120 bytes of text, the opposite of the goal.
 
-Everything that does not fit goes behind **one overflow variant**, `Big(Box<Big>)`, where `Big` is a second enum (32 bytes, boxed, so its size is irrelevant). A `const` assertion pins `size_of::<TextElement>() == 16` so a new variant that silently bumps it to 24 fails to compile.
+Everything that does not fit goes behind **one overflow variant**, `Big(Box<BigElement>)`, where `BigElement` is a second enum (32 bytes, boxed, so its size is irrelevant). A `const` assertion pins `size_of::<TextElement>() == TEXT_ELEMENT_SIZE` (16) so a new variant that silently bumps it to 24 fails to compile. The tag has spare values, so `Option<TextElement>` is 16 bytes too.
 
 Inline variants (target):
 
@@ -38,13 +38,13 @@ Inline variants (target):
 | `KeyVal`, `Username`, `Email` | two indices | 8 |
 | `Integer(i64)`, `Float(f64)`, `Timestamp(u64)` | native | 8 |
 | `Day(i16, u8, u8)`, `Time(u8, u8, u8)` | native | 4 / 3 |
-| `IPv4([u8; 4])` | native | 4 |
-| `Hex(u64, HexFormat)` | up to 16 digits + format | 9 |
+| `IPv4(Ipv4Addr)` | native | 4 |
+| `HexStr(Hex, HexFormat)` | up to 16 digits + format | 9 |
 | `Big(Box<Big>)` | pointer | 8 |
 
-Boxed variants (`Big`): `IPv6([u8; 16])`, `Range(i64, i64, Character)`, `Sentence(Vec<CompactStr>)`, `URLStr(Vec<CompactStr>)`, `URLParams(Vec<CompactStr>)`, wide hex (`u128` or interned) for hashes and UUIDs. Ranges are rare in log text; IPv6 and URLs are not, see "Open questions".
+Boxed variants (`BigElement`): `IPv6(Ipv6Addr)`, `Range(i64, i64, Character)`, `Sentence(Vec<CompactStr>)`, `URLStr(Vec<CompactStr>)`, `URLParams(Vec<CompactStr>)`. Hex wider than 16 digits (hashes, UUIDs) has no variant yet and will fall back to `Word` under the re-render rule; add a boxed `u128` or interned variant with the hex recognizer if interning them turns out to hurt. Ranges are rare in log text; IPv6 and URLs are not, see "Open questions".
 
-The exact split between inline and boxed is an implementation detail: expose `Big` through accessor methods on `TextElement` (`as_ip()`, `as_range()`, …), not as a public enum, so variants can move across the boundary without breaking callers.
+The exact split between inline and boxed is an implementation detail: `TextElement` has constructors (`ip`, `range`, `sentence`, `url`, `url_params`) and accessors (`as_ip`, more as needed) that hide the `Big` variant, and `WithStore<TextElement>`'s `Debug` prints a boxed element as itself (`IPv6(fe80::1)`, never `Big(..)`). Keep `BigElement` out of the public API so variants can move across the boundary without breaking callers.
 
 ### 3. Enclosures are brackets, not a tree
 
@@ -64,7 +64,7 @@ The sketch's `StructuredLine` holds an `Arc<UniqueStrStore>`. `UniqueStrStore` i
 
 ### 7. Hex keeps its width
 
-`HexFormat` is a `u8` bitmap using three bits (`UPPER`, `PREFIX`, `COLUMNS`). The spare five bits hold the digit count (1–16 fits in four), which restores leading zeros and makes most hex round-trip exactly without going through the fallback. Values longer than 16 digits are boxed or interned. The current `COLUMNS` grouping (by four digits from the right) matches neither MAC addresses (by two) nor anything common in logs; revisit or drop it when the recognizer is written.
+`HexFormat` is a `u8` bitmap using three bits (`UPPER`, `PREFIX`, `COLUMNS`). The spare five bits hold the digit width (`with_width`, 0 = natural, clamped to 31), which zero-pads the digits so `0x00ff` renders back as written, making most hex round-trip exactly without going through the fallback. Values longer than 16 digits do not fit `Hex(u64)`; see decision 2. The current `COLUMNS` grouping (by four digits from the right) matches neither MAC addresses (by two) nor anything common in logs; revisit or drop it when the recognizer is written.
 
 ### 8. Timestamps are opt-in
 
@@ -100,7 +100,7 @@ The exact list grows with the recognizers; keep it in this table.
 
 Each step is independently testable and leaves the crate building with no new dead code.
 
-1. **Data model** (decisions 2–7): slim the enum, add `Big`, flatten enclosures, drop the generic and the `Arc`, intern raw text, split IPv4 from IPv6, pin the size with a `const` assertion. Update the existing `Display`/`Debug` tests. No unsafe, no concurrency.
+1. **Data model** (decisions 2–7) — *done.* Slimmed the enum, added `BigElement`, flattened enclosures, dropped the generic and the `Arc`, interned raw text, split IPv4 from IPv6, pinned the size with a `const` assertion, gave `HexFormat` its width. No unsafe, no concurrency.
 2. **Scanner extensions**: the whitespace-class delimiter with run counting, then enclosure pairs. Pure code, checked against the `reference_tokenize` oracle in the test module extended with the new rules.
 3. **Unambiguous recognizers**: integer, float, prefixed hex, IPv4/IPv6 via `std::net` parsing, `YYYY-MM-DD`, `HH:MM:SS`, `key=value`. Plus the re-render check.
 4. **`Parser` and `parse`**: wire the three stages, with a property test that random log-like lines round-trip through `Display` byte for byte.
