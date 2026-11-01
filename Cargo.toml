@@ -15,11 +15,15 @@ edition = "2021"
 rust-version = "1.93"
 
 [features]
+default = ["structured"]
 #default = ["size_of"]
 size_of = ["dep:size-of"]
 # 128-bit xxh3 index keys: duplicate inserts skip the content check, at
 # twice the per-entry index footprint. See `HashKey`.
 xxh128 = ["dep:xxhash-rust"]
+# The structured-text data model (and, later, its parser): `src/structured.rs`.
+# Pulls in `timesince`. See `doc/design/structured-text.md`.
+structured = ["dep:timesince"]
 
 [dependencies]
 parking_lot = "0.12"
@@ -43,6 +47,7 @@ git = "https://github.com/Ukko-Ylijumala/custom_xxh3"
 
 [dependencies.timesince]
 git = "https://github.com/Ukko-Ylijumala/timesince-rs"
+optional = true
 
 [dependencies.miniutils]
 git = "https://github.com/Ukko-Ylijumala/miniutils-rs"

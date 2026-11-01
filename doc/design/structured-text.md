@@ -1,6 +1,6 @@
 # Structured text
 
-**Status: data model done, no parser.** `src/lib.rs` carries the data model (`TextElement`, `BigElement`, `StructuredLine`, `CompactStr`, `Character`, `Hex`, `HexFormat`) reworked from a 2024 sketch to the decisions below — step 1 of the implementation order. It compiles under scoped `#[expect(dead_code)]` and has tests only for its layout and `Display`/`Debug` output; nothing produces a `StructuredLine` from text yet. The shapes are still unstable: the open questions at the end may move variants around.
+**Status: data model done, no parser.** `src/structured.rs` (behind the `structured` feature, on by default) carries the data model (`TextElement`, `BigElement`, `StructuredLine`, `CompactStr`, `Character`, `Hex`, `HexFormat`) reworked from a 2024 sketch to the decisions below — step 1 of the implementation order. It compiles under scoped `#[expect(dead_code)]` and has tests only for its layout and `Display`/`Debug` output; nothing produces a `StructuredLine` from text yet. The shapes are still unstable: the open questions at the end may move variants around.
 
 ## Goal
 
@@ -105,7 +105,7 @@ Each step is independently testable and leaves the crate building with no new de
 3. **Unambiguous recognizers**: integer, float, prefixed hex, IPv4/IPv6 via `std::net` parsing, `YYYY-MM-DD`, `HH:MM:SS`, `key=value`. Plus the re-render check.
 4. **`Parser` and `parse`**: wire the three stages, with a property test that random log-like lines round-trip through `Display` byte for byte.
 5. **Heuristic recognizers**: hostname, email, URL, sentence, date-time to `Timestamp`. Each needs a dictionary, a config or context; each lands without touching steps 1–4.
-6. **Housekeeping**: a `structured` cargo feature gating the parser (which makes `timesince` optional — it serves only `Timestamp`), and a module split (`src/scan.rs`, `src/structured.rs`) once `lib.rs` grows past comfort.
+6. **Housekeeping** — *done early, so the parser lands in its final home.* The `structured` cargo feature (default on) gates `src/structured.rs` and makes `timesince` optional (it serves only `Timestamp`); the scanner moved to `src/scan.rs`. `lib.rs` keeps the store.
 
 ## Open questions
 
