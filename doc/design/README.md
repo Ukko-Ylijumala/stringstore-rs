@@ -9,5 +9,6 @@ Per-feature design documentation for the `stringstore` crate. Each file is self-
 | [unsafe-pointers.md](unsafe-pointers.md) | `borrow_str`, `StoredStrPtr`, and the append-only invariant that makes them sound |
 | [tokenization.md](tokenization.md) | `tokenize` vs `tokenize_regex`, the dispatch heuristic, known divergence cases |
 | [splitting-and-paths.md](splitting-and-paths.md) | Sentinel-zero encoding shared by `split_and_store`, `store_path`, and `reconstruct` |
+| [structured-text.md](structured-text.md) | **Design only.** The planned structured-text parser: 16-byte `TextElement` with a boxed overflow variant, lossless round trip by re-rendering, the scan → recognize → intern pipeline, and the implementation order |
 
 The crate is heavily WIP — these docs describe the design as it stands today, including the rough edges. Where a doc calls out a footgun or TODO, that is a real one.

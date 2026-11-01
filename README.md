@@ -2,7 +2,7 @@
 
 A memory-efficient, thread-safe string interning library for Rust with stable `u32` indices.
 
-> **Status: heavily WIP.** This crate is pre-1.0 (currently `0.3.x`) and *not* published to crates.io. APIs, internal layout, error variants, and tokenizer behavior may all change without notice. The dormant `TextElement` / `StructuredLine` scaffolding in `src/lib.rs` is an explicit work-in-progress and is not part of the supported surface. If you depend on this crate, pin to an exact git rev.
+> **Status: heavily WIP.** This crate is pre-1.0 (currently `0.3.x`) and *not* published to crates.io. APIs, internal layout, error variants, and tokenizer behavior may all change without notice. The dormant `TextElement` / `StructuredLine` scaffolding in `src/lib.rs` is an explicit work-in-progress and is not part of the supported surface; its target design is in [`doc/design/structured-text.md`](doc/design/structured-text.md). If you depend on this crate, pin to an exact git rev.
 
 ## What it does
 

@@ -62,7 +62,7 @@ The original linear loop survives verbatim in the test module as `reference_toke
 
 ## Extension point
 
-`ByteClass` is deliberately an enum rather than a bool. The structured-text scaffolding (`TextElement`, `StructuredLine`) will need splitting rules a literal alternation cannot express — character-class delimiters ("any whitespace"), repeated-character runs (`Character(_, n)`), and enclosures where inner delimiters must not split (`EnclosedElem`). Each of those is another `ByteClass` variant plus a branch in `scan_tokens`; the entry points and `Token` need not change. Per-token *recognition* (is this an IP address, a date, hex) is a separate step that runs on the emitted slices, not part of the scanner.
+`ByteClass` is deliberately an enum rather than a bool. The structured-text parser (`structured-text.md`) will need splitting rules a literal alternation cannot express — character-class delimiters ("any whitespace") whose runs collapse into one `Character(_, n)` delimiter, and enclosure pairs that suppress splitting between an `Open` and a `Close` element. Each of those is another `ByteClass` variant plus a branch in `scan_tokens`; the entry points and `Token` need not change. Per-token *recognition* (is this an IP address, a date, hex) is a separate step that runs on the emitted slices, not part of the scanner.
 
 If a caller ever needs a pattern-defined delimiter (a regex), the right shape is a new entry point that takes a caller-compiled `Regex`, not per-call compilation.
 
